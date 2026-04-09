@@ -1,4 +1,8 @@
-"""Light-SAM style ViT image encoder (Table 2: d_model=384, depth=12, heads=8, patch=16)."""
+"""
+Fallback ViT patch encoder (Table 2 dims) when `segment_anything` is unavailable.
+
+Prefer `sam_backbone.RDLNetSAMEncoder` (official SAM ImageEncoderViT with window/global blocks).
+"""
 
 from __future__ import annotations
 

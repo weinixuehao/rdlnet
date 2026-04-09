@@ -11,8 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .backbone import LightSAMViT
 from .ms_deform_attn import MultiScaleDeformableAttention
+from .sam_backbone import build_backbone
 
 
 @dataclass
@@ -22,6 +22,12 @@ class RDLNetConfig:
     backbone_dim: int = 384
     backbone_depth: int = 12
     backbone_heads: int = 8
+    # SAM ImageEncoderViT (supplementary Table 2); ignored if use_sam_image_encoder=False
+    use_sam_image_encoder: bool = True
+    sam_window_size: int = 14
+    sam_global_attn_indexes: Tuple[int, ...] = (2, 8)
+    # SAM-style ImageNet normalization (same as build_sam). Use True with real photos in 0–255 or 0–1.
+    use_sam_pixel_norm: bool = False
     hidden_dim: int = 256
     num_encoder_layers: int = 6
     num_decoder_layers: int = 6
@@ -160,14 +166,7 @@ class RDLNet(nn.Module):
         self.cfg = cfg
         self.num_point_coords = cfg.num_points * 2
 
-        self.backbone = LightSAMViT(
-            img_size=cfg.img_size,
-            patch_size=cfg.patch_size,
-            embed_dim=cfg.backbone_dim,
-            depth=cfg.backbone_depth,
-            num_heads=cfg.backbone_heads,
-            dropout=cfg.dropout,
-        )
+        self.backbone = build_backbone(cfg)
 
         c = cfg.backbone_dim
         h = cfg.hidden_dim
@@ -199,6 +198,22 @@ class RDLNet(nn.Module):
         self.mask_pixel_proj = nn.Linear(h, h)
 
         self.input_proj = nn.ModuleList([nn.Conv2d(h, h, kernel_size=3, stride=2, padding=1) for _ in range(3)])
+
+        # segment_anything/build_sam.py pixel stats (for optional use_sam_pixel_norm)
+        self.register_buffer(
+            "_pixel_mean", torch.tensor([123.675, 116.28, 103.53]).view(1, 3, 1, 1), persistent=False
+        )
+        self.register_buffer(
+            "_pixel_std", torch.tensor([58.395, 57.12, 57.375]).view(1, 3, 1, 1), persistent=False
+        )
+
+    def _preprocess_pixels(self, images: Tensor) -> Tensor:
+        if not self.cfg.use_sam_pixel_norm:
+            return images
+        x = images
+        if x.max() <= 1.0 + 1e-3:
+            x = x * 255.0
+        return (x - self._pixel_mean) / self._pixel_std
 
     def _build_multiscale(self, feat: Tensor) -> Tuple[Tensor, List[Tuple[int, int]], Tensor]:
         """feat [B,h,H,W] -> concat tokens, spatial_shapes, level_start_index."""
@@ -246,6 +261,7 @@ class RDLNet(nn.Module):
             dict with pred_logits, pred_masks, pred_points, prior_mask_logits, aux_decoder_masks
         """
         cfg = self.cfg
+        images = self._preprocess_pixels(images)
         b, _, gh, gw = images.shape
         gph, gpw = gh // cfg.patch_size, gw // cfg.patch_size
 
