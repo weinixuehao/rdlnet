@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -39,9 +40,26 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Stage 2: train RDLNet on annotated documents")
     p.add_argument("--annotations", type=str, required=True, help="JSON list (see rdlnet.data.doc_json)")
     p.add_argument("--image-root", type=str, required=True, help="Root for file_name and mask paths")
-    p.add_argument("--distill-checkpoint", type=str, default=None, help="Stage-1 student_encoder weights")
+    p.add_argument(
+        "--distill-checkpoint",
+        type=str,
+        default=None,
+        help="Stage-1 student_encoder weights (ignored if --resume loads a full model)",
+    )
     p.add_argument("--output", type=str, default="checkpoints/rdlnet.pt")
-    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Resume full training state (model+optimizer+epoch) from a previous train_rdlnet checkpoint",
+    )
+    p.add_argument("--epochs", type=int, default=50, help="Additional epochs when resuming, or total epochs from scratch")
+    p.add_argument(
+        "--save-every-steps",
+        type=int,
+        default=0,
+        help="If >0, save a snapshot every N steps to *_latest.pt (Colab disconnect recovery)",
+    )
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
@@ -80,18 +98,30 @@ def main() -> None:
     )
 
     model = RDLNet(cfg).to(device)
-    if args.distill_checkpoint:
-        load_student_encoder_into_rdlnet_from_checkpoint(model, args.distill_checkpoint)
-        print(f"Loaded student backbone from {args.distill_checkpoint}")
-
     matcher = build_matcher(cfg)
     criterion = RDLNetLoss(cfg, matcher)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    os.makedirs(Path(args.output).parent or ".", exist_ok=True)
-
+    start_epoch = 0
     global_step = 0
-    for epoch in range(args.epochs):
+    if args.resume:
+        ck = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ck["model"])
+        if "optimizer" in ck:
+            opt.load_state_dict(ck["optimizer"])
+        start_epoch = int(ck.get("epoch", 0))
+        global_step = int(ck.get("global_step", 0))
+        print(f"Resumed from {args.resume}: epoch={start_epoch}, global_step={global_step}")
+    elif args.distill_checkpoint:
+        load_student_encoder_into_rdlnet_from_checkpoint(model, args.distill_checkpoint)
+        print(f"Loaded student backbone from {args.distill_checkpoint}")
+
+    os.makedirs(Path(args.output).parent or ".", exist_ok=True)
+    out_path = Path(args.output)
+    step_ckpt = out_path.with_name(out_path.stem + "_latest.pt")
+
+    end_epoch = start_epoch + args.epochs
+    for epoch in range(start_epoch, end_epoch):
         model.train()
         epoch_loss = 0.0
         n_batches = 0
@@ -114,9 +144,22 @@ def main() -> None:
             global_step += 1
             if global_step % 20 == 0:
                 print(
-                    f"epoch {epoch+1}/{args.epochs} step {global_step} loss={loss.item():.4f} "
+                    f"epoch {epoch+1}/{end_epoch} step {global_step} loss={loss.item():.4f} "
                     f"cls={logs['loss_cls'].item():.4f} mask={logs['loss_mask'].item():.4f}"
                 )
+            if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
+                torch.save(
+                    {
+                        "model": model.state_dict(),
+                        "optimizer": opt.state_dict(),
+                        "config": asdict(cfg),
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "note": "mid-epoch",
+                    },
+                    step_ckpt,
+                )
+                print(f"Saved step checkpoint -> {step_ckpt}")
 
         avg = epoch_loss / max(n_batches, 1)
         print(f"epoch {epoch+1} mean loss={avg:.4f}")
@@ -124,8 +167,10 @@ def main() -> None:
         torch.save(
             {
                 "model": model.state_dict(),
-                "config": cfg,
+                "optimizer": opt.state_dict(),
+                "config": asdict(cfg),
                 "epoch": epoch + 1,
+                "global_step": global_step,
             },
             args.output,
         )

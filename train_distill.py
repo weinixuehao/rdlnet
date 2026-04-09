@@ -48,8 +48,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--image-dir", type=str, required=True, help="Directory of RGB images (recursive)")
     p.add_argument("--teacher-checkpoint", type=str, required=True, help="sam_vit_h_4b8939.pth")
     p.add_argument("--output", type=str, default="checkpoints/distill_stage1.pt")
-    p.add_argument("--resume", type=str, default=None, help="Resume from stage-1 checkpoint")
-    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--resume", type=str, default=None, help="Resume from stage-1 checkpoint (weights + optimizer if present)")
+    p.add_argument("--epochs", type=int, default=1, help="Number of additional epochs to run in this session")
+    p.add_argument(
+        "--save-every-steps",
+        type=int,
+        default=0,
+        help="If >0, also save a copy of the checkpoint every N steps (for Colab disconnects mid-epoch)",
+    )
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
@@ -89,16 +95,26 @@ def main() -> None:
         cfg=cfg,
     ).to(device)
 
+    opt = torch.optim.AdamW(distill.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    start_epoch = 0
+    global_step = 0
     if args.resume:
         ck = torch.load(args.resume, map_location=device)
         load_distill_trainable_state_dict(distill, ck)
-
-    opt = torch.optim.AdamW(distill.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        if isinstance(ck, dict) and "optimizer" in ck:
+            opt.load_state_dict(ck["optimizer"])
+        meta = ck.get("meta") or {}
+        start_epoch = int(meta.get("epochs_done", 0))
+        global_step = int(ck.get("global_step", 0))
+        print(f"Resumed from {args.resume}: epochs_done={start_epoch}, global_step={global_step}")
 
     os.makedirs(Path(args.output).parent or ".", exist_ok=True)
+    out_path = Path(args.output)
+    step_ckpt = out_path.with_name(out_path.stem + "_latest.pt")
 
-    global_step = 0
-    for epoch in range(args.epochs):
+    end_epoch = start_epoch + args.epochs
+    for epoch in range(start_epoch, end_epoch):
         distill.train()
         for imgs, _paths in loader:
             imgs = imgs.to(device)
@@ -110,9 +126,22 @@ def main() -> None:
             global_step += 1
             if global_step % 50 == 0:
                 print(
-                    f"epoch {epoch+1}/{args.epochs} step {global_step} "
+                    f"epoch {epoch+1}/{end_epoch} step {global_step} "
                     f"loss={loss.item():.4f} kl={out['loss_kl'].item():.4f} md={out['loss_md'].item():.4f}"
                 )
+            if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
+                meta = {
+                    "img_size": args.img_size,
+                    "backbone_dim": student_wrap.embed_dim,
+                    "backbone_depth": student_wrap.depth,
+                    "epochs_done": epoch,
+                    "note": "mid-epoch snapshot",
+                }
+                ckpt = distill_trainable_state_dict(distill, meta=meta)
+                ckpt["optimizer"] = opt.state_dict()
+                ckpt["global_step"] = global_step
+                torch.save(ckpt, step_ckpt)
+                print(f"Saved step checkpoint -> {step_ckpt}")
 
         meta = {
             "img_size": args.img_size,
@@ -121,6 +150,8 @@ def main() -> None:
             "epochs_done": epoch + 1,
         }
         ckpt = distill_trainable_state_dict(distill, meta=meta)
+        ckpt["optimizer"] = opt.state_dict()
+        ckpt["global_step"] = global_step
         torch.save(ckpt, args.output)
         print(f"Saved checkpoint to {args.output}")
 
