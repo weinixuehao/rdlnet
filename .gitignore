@@ -1,3 +1,4 @@
 *.DS_Store
 checkpoints/
 _tmp_train_data/
+.venv
