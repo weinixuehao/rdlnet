@@ -3,10 +3,13 @@
 from .distill import (
     DistillConfig,
     LightSAMMultiplexDistillation,
-    create_distillation_setup,
-    load_distilled_student_into_rdlnet,
-    load_teacher_weights_from_sam_checkpoint,
     build_teacher_image_encoder_vit_h,
+    create_distillation_setup,
+    distill_trainable_state_dict,
+    load_distill_trainable_state_dict,
+    load_distilled_student_into_rdlnet,
+    load_student_encoder_into_rdlnet_from_checkpoint,
+    load_teacher_weights_from_sam_checkpoint,
 )
 from .losses import RDLNetLoss, build_matcher
 from .model import RDLNet, RDLNetConfig
@@ -22,4 +25,7 @@ __all__ = [
     "load_teacher_weights_from_sam_checkpoint",
     "build_teacher_image_encoder_vit_h",
     "load_distilled_student_into_rdlnet",
+    "distill_trainable_state_dict",
+    "load_distill_trainable_state_dict",
+    "load_student_encoder_into_rdlnet_from_checkpoint",
 ]

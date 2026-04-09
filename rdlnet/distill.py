@@ -231,6 +231,22 @@ class LightSAMMultiplexDistillation(nn.Module):
         }
 
 
+def distill_trainable_state_dict(distill_mod: LightSAMMultiplexDistillation, meta: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+    """Checkpoint for stage 1: student encoder + KL head (teacher not saved)."""
+    out: Dict[str, object] = {
+        "student_encoder": distill_mod.student.state_dict(),
+        "kl_proj": distill_mod.kl_proj.state_dict(),
+    }
+    if meta is not None:
+        out["meta"] = meta
+    return out
+
+
+def load_distill_trainable_state_dict(distill_mod: LightSAMMultiplexDistillation, state: Dict[str, object]) -> None:
+    distill_mod.student.load_state_dict(state["student_encoder"])
+    distill_mod.kl_proj.load_state_dict(state["kl_proj"])
+
+
 def load_distilled_student_into_rdlnet(rdlnet: nn.Module, student_encoder: nn.Module) -> None:
     """
     After distillation, copy weights into `RDLNet.backbone` when it is `RDLNetSAMEncoder`
@@ -239,6 +255,20 @@ def load_distilled_student_into_rdlnet(rdlnet: nn.Module, student_encoder: nn.Mo
     if not hasattr(rdlnet, "backbone") or not hasattr(rdlnet.backbone, "encoder"):
         raise TypeError("Expected RDLNet with sam_backbone.RDLNetSAMEncoder")
     rdlnet.backbone.encoder.load_state_dict(student_encoder.state_dict())
+
+
+def load_student_encoder_into_rdlnet_from_checkpoint(rdlnet: nn.Module, checkpoint_path: str | Path) -> None:
+    """Load only ``student_encoder`` from a stage-1 checkpoint file into the RDLNet SAM backbone."""
+    ck = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(ck, dict) and "student_encoder" in ck:
+        sd = ck["student_encoder"]
+    elif isinstance(ck, dict) and not any(k in ck for k in ("kl_proj", "meta", "model")):
+        sd = ck
+    else:
+        raise KeyError("Expected a stage-1 checkpoint with key 'student_encoder', or a raw encoder state_dict.")
+    if not hasattr(rdlnet, "backbone") or not hasattr(rdlnet.backbone, "encoder"):
+        raise TypeError("Expected RDLNet with sam_backbone.RDLNetSAMEncoder")
+    rdlnet.backbone.encoder.load_state_dict(sd)
 
 
 def create_distillation_setup(
