@@ -71,6 +71,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
+    print(f"device => {device}")
 
     ds = DistillImageFolder(args.image_dir, img_size=args.img_size)
     loader = DataLoader(
