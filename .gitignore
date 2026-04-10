@@ -1,4 +1,6 @@
 *.DS_Store
 checkpoints/
 _tmp_train_data/
+data/coco/
 .venv
+.vscode
