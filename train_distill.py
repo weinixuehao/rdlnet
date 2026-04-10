@@ -117,6 +117,7 @@ def main() -> None:
     for epoch in range(start_epoch, end_epoch):
         distill.train()
         for imgs, _paths in loader:
+            print(_paths)
             imgs = imgs.to(device)
             out = distill(imgs)
             loss = out["loss"]
