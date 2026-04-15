@@ -5,3 +5,4 @@ data/coco/
 data/raw/
 .venv
 .vscode
+.tmp_pypdf
