@@ -6,3 +6,6 @@ data/raw/
 .venv
 .vscode
 .tmp_pypdf
+__pycache__/
+dataset/
+output

@@ -4,7 +4,7 @@ Stage 2: Train full RDLNet on document localization annotations (paper losses, S
 
 Initialize the SAM student backbone from stage-1 ``distill_stage1.pt`` (recommended).
 
-Example::
+Example (manifest JSON)::
 
     python train_rdlnet.py \\
         --annotations data/annotations.json \\
@@ -12,7 +12,15 @@ Example::
         --distill-checkpoint checkpoints/distill_stage1.pt \\
         --output checkpoints/rdlnet.pt
 
-See ``rdlnet.data.doc_json`` for the JSON format.
+Example (RWMD LabelMe tree, e.g. ``RWMD_dataset_v1``)::
+
+    python train_rdlnet.py \\
+        --rwmd-root dataset/RWMD_dataset/RWMD_dataset_v1 \\
+        --num-classes 9 \\
+        --distill-checkpoint checkpoints/distill_stage1.pt \\
+        --output checkpoints/rdlnet.pt
+
+See ``rdlnet.data.doc_json`` for the manifest format and :class:`RWMDLabelMeDataset`.
 """
 
 from __future__ import annotations
@@ -30,7 +38,7 @@ _REPO = Path(__file__).resolve().parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from rdlnet.data import DocLocalizationJsonDataset, collate_doc_batch
+from rdlnet.data import DocLocalizationJsonDataset, RWMDLabelMeDataset, collate_doc_batch
 from rdlnet.distill import load_student_encoder_into_rdlnet_from_checkpoint
 from rdlnet.losses import RDLNetLoss, build_matcher
 from rdlnet.model import RDLNet, RDLNetConfig
@@ -38,8 +46,34 @@ from rdlnet.model import RDLNet, RDLNetConfig
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Stage 2: train RDLNet on annotated documents")
-    p.add_argument("--annotations", type=str, required=True, help="JSON list (see rdlnet.data.doc_json)")
-    p.add_argument("--image-root", type=str, required=True, help="Root for file_name and mask paths")
+    p.add_argument("--annotations", type=str, default=None, help="JSON list (see rdlnet.data.doc_json)")
+    p.add_argument("--image-root", type=str, default=None, help="Root for file_name and mask paths")
+    p.add_argument(
+        "--rwmd-root",
+        type=str,
+        default=None,
+        help="RWMD LabelMe root (recursive *.json). If set, --annotations/--image-root are not used.",
+    )
+    p.add_argument(
+        "--num-classes",
+        type=int,
+        default=None,
+        help="Override RDLNetConfig.num_classes (recommended 9 for RWMD folder mode; default 3 for manifest)",
+    )
+    p.add_argument(
+        "--rwmd-label-mode",
+        type=str,
+        choices=["folder", "layer", "zero"],
+        default="folder",
+        help="RWMD: class label from scene folder, from layer id, or all 0",
+    )
+    p.add_argument(
+        "--rwmd-instance-order",
+        type=str,
+        choices=["foreground_first", "numeric_then_foreground", "json_order"],
+        default="foreground_first",
+        help="RWMD: which polygons to keep when truncating to num_queries",
+    )
     p.add_argument(
         "--distill-checkpoint",
         type=str,
@@ -66,6 +100,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--img-size", type=int, default=1024)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument(
+        "--ignore-padded-points",
+        action="store_true",
+        help="Exclude padded (0,0) point pairs from point matching cost and point distance loss",
+    )
+    p.add_argument(
+        "--padded-point-eps",
+        type=float,
+        default=0.0,
+        help="Treat |x|<=eps and |y|<=eps as padded (default: 0.0)",
+    )
     return p.parse_args()
 
 
@@ -73,21 +118,38 @@ def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
 
+    num_classes = args.num_classes if args.num_classes is not None else 3
     cfg = RDLNetConfig(
         img_size=args.img_size,
+        num_classes=num_classes,
         use_sam_pixel_norm=True,
+        ignore_padded_points=args.ignore_padded_points,
+        padded_point_eps=args.padded_point_eps,
     )
     if args.img_size % cfg.patch_size != 0:
         raise ValueError("img_size must be divisible by patch_size")
 
-    ds = DocLocalizationJsonDataset(
-        args.annotations,
-        args.image_root,
-        img_size=args.img_size,
-        num_classes=cfg.num_classes,
-        num_points=cfg.num_points,
-        max_instances=cfg.num_queries,
-    )
+    if args.rwmd_root:
+        ds = RWMDLabelMeDataset(
+            args.rwmd_root,
+            img_size=args.img_size,
+            num_classes=cfg.num_classes,
+            num_points=cfg.num_points,
+            max_instances=cfg.num_queries,
+            label_mode=args.rwmd_label_mode,
+            instance_order=args.rwmd_instance_order,
+        )
+    else:
+        if not args.annotations or not args.image_root:
+            raise SystemExit("Provide either --rwmd-root, or both --annotations and --image-root")
+        ds = DocLocalizationJsonDataset(
+            args.annotations,
+            args.image_root,
+            img_size=args.img_size,
+            num_classes=cfg.num_classes,
+            num_points=cfg.num_points,
+            max_instances=cfg.num_queries,
+        )
     loader = DataLoader(
         ds,
         batch_size=args.batch_size,
