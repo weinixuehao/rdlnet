@@ -23,7 +23,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -101,7 +101,7 @@ def profile_one_batch(
 
     distill.train()
     opt.zero_grad(set_to_none=True)
-    with autocast(enabled=use_amp):
+    with autocast("cuda", enabled=use_amp):
         out = distill(imgs)
     loss = out["loss"]
     # One-step timing: no GradScaler (avoids mutating training scaler before the loop).
@@ -326,7 +326,7 @@ def main() -> None:
     ).to(device)
 
     opt = torch.optim.AdamW(distill.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler: GradScaler | None = GradScaler() if use_amp else None
+    scaler: GradScaler | None = GradScaler("cuda") if use_amp else None
 
     start_epoch = 0
     global_step = 0
@@ -430,7 +430,7 @@ def main() -> None:
         opt.zero_grad(set_to_none=True)
         for imgs, _paths in pbar:
             imgs = imgs.to(device)
-            with autocast(enabled=use_amp):
+            with autocast("cuda", enabled=use_amp):
                 out = distill(imgs)
             loss = out["loss"]
             if scaler is not None:
