@@ -17,9 +17,11 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -46,6 +48,80 @@ def pick_device() -> torch.device:
     if mps is not None and mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def print_runtime_context(
+    device: torch.device,
+    image_dir: str,
+    ds_len: int,
+    batch_size: int,
+    num_workers: int,
+    distill: nn.Module,
+) -> None:
+    """Where compute runs + loader settings (SSD/CPU decode vs GPU)."""
+    pin = device.type == "cuda"
+    print(f"image-dir: {image_dir}  |  dataset: {ds_len} images")
+    print(f"DataLoader: num_workers={num_workers}, pin_memory={pin}")
+    p0 = next(distill.parameters())
+    print(f"model params: device={p0.device}, dtype={p0.dtype}")
+    if device.type == "cuda":
+        idx = device.index if device.index is not None else 0
+        print(f"CUDA: {torch.cuda.get_device_name(idx)}")
+        cap = torch.cuda.get_device_properties(idx).total_memory / (1024**3)
+        print(f"CUDA VRAM: {cap:.1f} GiB total")
+        print(f"CUDA mem allocated (now): {torch.cuda.memory_allocated(idx) / 1e6:.0f} MB")
+    elif device.type == "mps":
+        print("MPS: Apple GPU (no nvidia-smi)")
+    else:
+        print("CPU: training will be much slower; check torch CUDA build + drivers if you expect a GPU.")
+
+
+def profile_one_batch(
+    loader: DataLoader,
+    distill: nn.Module,
+    opt: torch.optim.Optimizer,
+    device: torch.device,
+    pin_memory: bool,
+) -> None:
+    """
+    Time: dataloader vs forward+backward (no optimizer.step — avoids changing weights).
+    Large 'dataloader' => disk decode / CPU / num_workers; large 'forward+backward' => GPU compute bound.
+    """
+    it = iter(loader)
+    t0 = time.perf_counter()
+    imgs, _paths = next(it)
+    t1 = time.perf_counter()
+    imgs = imgs.to(device, non_blocking=pin_memory)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    t2 = time.perf_counter()
+
+    distill.train()
+    opt.zero_grad(set_to_none=True)
+    out = distill(imgs)
+    loss = out["loss"]
+    loss.backward()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
+    t3 = time.perf_counter()
+    opt.zero_grad(set_to_none=True)
+
+    dl_ms = (t1 - t0) * 1000
+    h2d_ms = (t2 - t1) * 1000
+    comp_ms = (t3 - t2) * 1000
+    total_ms = (t3 - t0) * 1000
+    print(
+        "[profile-batch] times (ms):  dataloader_next={:.1f}  h2d+sync={:.1f}  forward+backward+sync={:.1f}  (sum={:.1f})".format(
+            dl_ms, h2d_ms, comp_ms, total_ms
+        )
+    )
+    print(f"[profile-batch] imgs: device={imgs.device}, is_cuda={imgs.is_cuda}")
+    if dl_ms > comp_ms * 1.5:
+        print("[profile-batch] hint: dataloader >> compute — try faster disk, more num_workers, or smaller img_size.")
+    elif comp_ms > dl_ms * 2 and device.type == "cuda":
+        print("[profile-batch] hint: GPU compute dominates — expected for ViT-H teacher + 1024; batch_size>1 if VRAM allows.")
 
 
 def collate_distill(batch):
@@ -145,6 +221,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="PNG path for loss curves (default: next to --output, e.g. distill_stage1_loss.png)",
     )
+    p.add_argument(
+        "--profile-batch",
+        action="store_true",
+        help="Print runtime (CPU/GPU/dataloader) and time one batch: disk+decode vs forward+backward",
+    )
     return p.parse_args()
 
 
@@ -152,6 +233,8 @@ def main() -> None:
     args = parse_args()
     device = pick_device()
     print(f"device => {device}")
+    if device.type == "cuda":
+        print(f"         ({torch.cuda.get_device_name(0)})")
 
     ds = DistillImageFolder(args.image_dir, img_size=args.img_size)
     loader = DataLoader(
@@ -214,6 +297,11 @@ def main() -> None:
     step_ckpt = out_path.with_name(out_path.stem + "_latest.pt")
     loss_plot_path = Path(args.loss_plot) if args.loss_plot else out_path.with_name(out_path.stem + "_loss.png")
     print(f"loss plot (PNG) => {loss_plot_path}")
+
+    if args.profile_batch:
+        print_runtime_context(device, args.image_dir, len(ds), args.batch_size, args.num_workers, distill)
+        profile_one_batch(loader, distill, opt, device, pin_memory=device.type == "cuda")
+        print("--- training starts ---")
 
     end_epoch = start_epoch + args.epochs
     for epoch in range(start_epoch, end_epoch):
