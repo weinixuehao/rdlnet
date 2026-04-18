@@ -23,6 +23,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -83,6 +84,7 @@ def profile_one_batch(
     opt: torch.optim.Optimizer,
     device: torch.device,
     pin_memory: bool,
+    use_amp: bool,
 ) -> None:
     """
     Time: dataloader vs forward+backward (no optimizer.step — avoids changing weights).
@@ -99,8 +101,10 @@ def profile_one_batch(
 
     distill.train()
     opt.zero_grad(set_to_none=True)
-    out = distill(imgs)
+    with autocast(enabled=use_amp):
+        out = distill(imgs)
     loss = out["loss"]
+    # One-step timing: no GradScaler (avoids mutating training scaler before the loop).
     loss.backward()
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -268,6 +272,11 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="RNG seed: torch/random, DataLoader shuffle, and (with --samples-per-epoch) subset indices per epoch",
     )
+    p.add_argument(
+        "--amp",
+        action="store_true",
+        help="CUDA mixed precision (fp16 forward under autocast, fp32 master weights + GradScaler). Ignored on non-CUDA.",
+    )
     return p.parse_args()
 
 
@@ -283,9 +292,13 @@ def main() -> None:
         torch.cuda.manual_seed_all(args.seed)
 
     device = pick_device()
+    use_amp = bool(args.amp and device.type == "cuda")
+    if args.amp and device.type != "cuda":
+        print("Warning: --amp is only supported on CUDA; training in fp32.")
     print(f"device => {device}")
     if device.type == "cuda":
         print(f"         ({torch.cuda.get_device_name(0)})")
+    print(f"AMP (fp16 autocast): {'on' if use_amp else 'off'}")
 
     ds = DistillImageFolder(
         args.image_dir,
@@ -313,6 +326,7 @@ def main() -> None:
     ).to(device)
 
     opt = torch.optim.AdamW(distill.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scaler: GradScaler | None = GradScaler() if use_amp else None
 
     start_epoch = 0
     global_step = 0
@@ -350,6 +364,14 @@ def main() -> None:
                 f"Warning: --seed ({args.seed}) != checkpoint meta seed ({int(ck_seed)}); "
                 "subset/DataLoader order may differ from the run that wrote this file."
             )
+        ck_amp = (ck.get("meta") or {}).get("amp")
+        if ck_amp is not None and bool(ck_amp) != use_amp:
+            print(
+                f"Warning: --amp ({use_amp}) != checkpoint meta amp ({bool(ck_amp)}); "
+                "optimizer/scaler state may be mismatched."
+            )
+        if scaler is not None and isinstance(ck.get("scaler"), dict):
+            scaler.load_state_dict(ck["scaler"])
 
     if args.samples_per_epoch is not None:
         ds.resample_epoch(start_epoch)
@@ -374,7 +396,9 @@ def main() -> None:
 
     if args.profile_batch:
         print_runtime_context(device, args.image_dir, len(ds), args.batch_size, args.num_workers, distill)
-        profile_one_batch(loader, distill, opt, device, pin_memory=device.type == "cuda")
+        profile_one_batch(
+            loader, distill, opt, device, pin_memory=device.type == "cuda", use_amp=use_amp
+        )
         print("--- training starts ---")
 
     end_epoch = start_epoch + args.epochs
@@ -406,9 +430,13 @@ def main() -> None:
         opt.zero_grad(set_to_none=True)
         for imgs, _paths in pbar:
             imgs = imgs.to(device)
-            out = distill(imgs)
+            with autocast(enabled=use_amp):
+                out = distill(imgs)
             loss = out["loss"]
-            (loss / accum).backward()
+            if scaler is not None:
+                scaler.scale(loss / accum).backward()
+            else:
+                (loss / accum).backward()
             accum_count += 1
             global_step += 1
             epoch_loss_sum += float(loss.detach())
@@ -423,7 +451,11 @@ def main() -> None:
                 accum=f"{accum_count}/{accum}",
             )
             if accum_count >= accum:
-                opt.step()
+                if scaler is not None:
+                    scaler.step(opt)
+                    scaler.update()
+                else:
+                    opt.step()
                 opt.zero_grad(set_to_none=True)
                 accum_count = 0
             if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
@@ -435,21 +467,30 @@ def main() -> None:
                     "grad_accum_steps": args.grad_accum_steps,
                     "samples_per_epoch": args.samples_per_epoch,
                     "seed": args.seed,
+                    "amp": use_amp,
                     "note": "mid-epoch snapshot",
                 }
                 ckpt = distill_trainable_state_dict(distill, meta=meta)
                 ckpt["optimizer"] = opt.state_dict()
                 ckpt["global_step"] = global_step
                 ckpt[LOSS_PLOT_HISTORY_KEY] = pack_loss_plot_history(hist_ep, hist_loss, hist_kl, hist_md)
+                if scaler is not None:
+                    ckpt["scaler"] = scaler.state_dict()
                 torch.save(ckpt, step_ckpt)
                 print(f"Saved step checkpoint -> {step_ckpt}")
 
         if accum_count > 0:
             scale = accum / accum_count
+            if scaler is not None:
+                scaler.unscale_(opt)
             for p in distill.parameters():
                 if p.grad is not None:
                     p.grad.mul_(scale)
-            opt.step()
+            if scaler is not None:
+                scaler.step(opt)
+                scaler.update()
+            else:
+                opt.step()
             opt.zero_grad(set_to_none=True)
 
         if n_batches > 0:
@@ -472,11 +513,14 @@ def main() -> None:
             "grad_accum_steps": args.grad_accum_steps,
             "samples_per_epoch": args.samples_per_epoch,
             "seed": args.seed,
+            "amp": use_amp,
         }
         ckpt = distill_trainable_state_dict(distill, meta=meta)
         ckpt["optimizer"] = opt.state_dict()
         ckpt["global_step"] = global_step
         ckpt[LOSS_PLOT_HISTORY_KEY] = pack_loss_plot_history(hist_ep, hist_loss, hist_kl, hist_md)
+        if scaler is not None:
+            ckpt["scaler"] = scaler.state_dict()
         torch.save(ckpt, args.output)
         print(f"Saved checkpoint to {args.output}")
 

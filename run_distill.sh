@@ -25,4 +25,10 @@ exec python train_distill.py \
   --image-dir dataset/train2017 \
   --teacher-checkpoint checkpoints/sam/sam_vit_h_4b8939.pth \
   --output checkpoints/distill_stage1.pt \
+  --samples-per-epoch 1024 \
+  --seed 42 \
+  --epochs 30 \
+  --batch-size 1 \
+  --num-workers 4 \
+  # --amp \
   "$@"
