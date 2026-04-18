@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -130,6 +131,28 @@ def collate_distill(batch):
     return imgs, paths
 
 
+def make_distill_loader(
+    ds: DistillImageFolder,
+    batch_size: int,
+    num_workers: int,
+    device: torch.device,
+    *,
+    seed: int,
+    epoch_index: int,
+) -> DataLoader:
+    g = torch.Generator()
+    g.manual_seed(seed + epoch_index * 1_000_003)
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=collate_distill,
+        pin_memory=device.type == "cuda",
+        generator=g,
+    )
+
+
 LOSS_PLOT_HISTORY_KEY = "loss_plot_history"
 
 
@@ -197,6 +220,13 @@ def save_loss_plot_png(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Stage 1: distill Light-SAM student from SAM ViT-H")
     p.add_argument("--image-dir", type=str, required=True, help="Directory of RGB images (recursive)")
+    p.add_argument(
+        "--samples-per-epoch",
+        type=int,
+        default=None,
+        help="Each epoch: random sample this many images from the full pool (no replacement). "
+        "Omits to use every image once per epoch (full pass).",
+    )
     p.add_argument("--teacher-checkpoint", type=str, required=True, help="sam_vit_h_4b8939.pth")
     p.add_argument("--output", type=str, default="checkpoints/distill_stage1.pt")
     p.add_argument("--resume", type=str, default=None, help="Resume from stage-1 checkpoint (weights + optimizer if present)")
@@ -208,6 +238,12 @@ def parse_args() -> argparse.Namespace:
         help="If >0, also save a copy of the checkpoint every N steps (for Colab disconnects mid-epoch)",
     )
     p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=8,
+        help="Micro-batches per optimizer step (effective batch = batch_size * this). Loss scaled as 1/steps per backward.",
+    )
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--img-size", type=int, default=1024, help="Must match stage 2 RDLNet img_size")
@@ -226,25 +262,42 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print runtime (CPU/GPU/dataloader) and time one batch: disk+decode vs forward+backward",
     )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="RNG seed: torch/random, DataLoader shuffle, and (with --samples-per-epoch) subset indices per epoch",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.grad_accum_steps < 1:
+        raise SystemExit("--grad-accum-steps must be >= 1")
+    if args.samples_per_epoch is not None and args.samples_per_epoch < 1:
+        raise SystemExit("--samples-per-epoch must be >= 1")
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     device = pick_device()
     print(f"device => {device}")
     if device.type == "cuda":
         print(f"         ({torch.cuda.get_device_name(0)})")
 
-    ds = DistillImageFolder(args.image_dir, img_size=args.img_size)
-    loader = DataLoader(
-        ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collate_distill,
-        pin_memory=device.type == "cuda",
+    ds = DistillImageFolder(
+        args.image_dir,
+        img_size=args.img_size,
+        samples_per_epoch=args.samples_per_epoch,
+        subset_seed=args.seed,
     )
+    if args.samples_per_epoch is not None:
+        print(
+            f"samples_per_epoch={args.samples_per_epoch}  |  pool_size={ds.pool_size}  |  subset_seed={args.seed} "
+            "(deterministic subset per global epoch index; not a full pass per epoch)"
+        )
 
     student_wrap = RDLNetSAMEncoder(img_size=args.img_size)
     cfg = DistillConfig(
@@ -291,12 +344,33 @@ def main() -> None:
                     f"Warning: last loss epoch id ({hist_ep[-1]}) != epochs_done ({start_epoch}); "
                     "plot x-axis may be wrong."
                 )
+        ck_seed = (ck.get("meta") or {}).get("seed")
+        if ck_seed is not None and int(ck_seed) != args.seed:
+            print(
+                f"Warning: --seed ({args.seed}) != checkpoint meta seed ({int(ck_seed)}); "
+                "subset/DataLoader order may differ from the run that wrote this file."
+            )
+
+    if args.samples_per_epoch is not None:
+        ds.resample_epoch(start_epoch)
+    loader = make_distill_loader(
+        ds,
+        args.batch_size,
+        args.num_workers,
+        device,
+        seed=args.seed,
+        epoch_index=start_epoch,
+    )
 
     os.makedirs(Path(args.output).parent or ".", exist_ok=True)
     out_path = Path(args.output)
     step_ckpt = out_path.with_name(out_path.stem + "_latest.pt")
     loss_plot_path = Path(args.loss_plot) if args.loss_plot else out_path.with_name(out_path.stem + "_loss.png")
     print(f"loss plot (PNG) => {loss_plot_path}")
+    eff_bs = args.batch_size * args.grad_accum_steps
+    print(
+        f"grad_accum_steps={args.grad_accum_steps}  |  effective batch size (for optimizer) ≈ {eff_bs}"
+    )
 
     if args.profile_batch:
         print_runtime_context(device, args.image_dir, len(ds), args.batch_size, args.num_workers, distill)
@@ -305,6 +379,18 @@ def main() -> None:
 
     end_epoch = start_epoch + args.epochs
     for epoch in range(start_epoch, end_epoch):
+        # First epoch of this session uses ds/loader from resample_epoch(start_epoch) before the loop.
+        # Resampling here every epoch would discard that subset and break --profile-batch vs epoch 0 alignment.
+        if args.samples_per_epoch is not None and epoch > start_epoch:
+            ds.resample_epoch(epoch)
+            loader = make_distill_loader(
+                ds,
+                args.batch_size,
+                args.num_workers,
+                device,
+                seed=args.seed,
+                epoch_index=epoch,
+            )
         distill.train()
         pbar = tqdm(
             loader,
@@ -315,13 +401,15 @@ def main() -> None:
         epoch_kl_sum = 0.0
         epoch_md_sum = 0.0
         n_batches = 0
+        accum = args.grad_accum_steps
+        accum_count = 0
+        opt.zero_grad(set_to_none=True)
         for imgs, _paths in pbar:
             imgs = imgs.to(device)
             out = distill(imgs)
             loss = out["loss"]
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
+            (loss / accum).backward()
+            accum_count += 1
             global_step += 1
             epoch_loss_sum += float(loss.detach())
             epoch_kl_sum += float(out["loss_kl"].detach())
@@ -332,13 +420,21 @@ def main() -> None:
                 loss=f"{loss.item():.4f}",
                 kl=f"{out['loss_kl'].item():.4f}",
                 md=f"{out['loss_md'].item():.4f}",
+                accum=f"{accum_count}/{accum}",
             )
+            if accum_count >= accum:
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+                accum_count = 0
             if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
                 meta = {
                     "img_size": args.img_size,
                     "backbone_dim": student_wrap.embed_dim,
                     "backbone_depth": student_wrap.depth,
                     "epochs_done": epoch,
+                    "grad_accum_steps": args.grad_accum_steps,
+                    "samples_per_epoch": args.samples_per_epoch,
+                    "seed": args.seed,
                     "note": "mid-epoch snapshot",
                 }
                 ckpt = distill_trainable_state_dict(distill, meta=meta)
@@ -347,6 +443,14 @@ def main() -> None:
                 ckpt[LOSS_PLOT_HISTORY_KEY] = pack_loss_plot_history(hist_ep, hist_loss, hist_kl, hist_md)
                 torch.save(ckpt, step_ckpt)
                 print(f"Saved step checkpoint -> {step_ckpt}")
+
+        if accum_count > 0:
+            scale = accum / accum_count
+            for p in distill.parameters():
+                if p.grad is not None:
+                    p.grad.mul_(scale)
+            opt.step()
+            opt.zero_grad(set_to_none=True)
 
         if n_batches > 0:
             m_loss = epoch_loss_sum / n_batches
@@ -365,6 +469,9 @@ def main() -> None:
             "backbone_dim": student_wrap.embed_dim,
             "backbone_depth": student_wrap.depth,
             "epochs_done": epoch + 1,
+            "grad_accum_steps": args.grad_accum_steps,
+            "samples_per_epoch": args.samples_per_epoch,
+            "seed": args.seed,
         }
         ckpt = distill_trainable_state_dict(distill, meta=meta)
         ckpt["optimizer"] = opt.state_dict()
