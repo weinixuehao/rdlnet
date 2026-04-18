@@ -44,6 +44,16 @@ from rdlnet.losses import RDLNetLoss, build_matcher
 from rdlnet.model import RDLNet, RDLNetConfig
 
 
+def pick_device() -> torch.device:
+    """Prefer CUDA, then Apple MPS, else CPU."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Stage 2: train RDLNet on annotated documents")
     p.add_argument("--annotations", type=str, default=None, help="JSON list (see rdlnet.data.doc_json)")
@@ -99,7 +109,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--img-size", type=int, default=1024)
     p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument(
         "--ignore-padded-points",
         action="store_true",
@@ -116,7 +125,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    device = torch.device(args.device)
+    device = pick_device()
+    print(f"device => {device}")
 
     num_classes = args.num_classes if args.num_classes is not None else 3
     cfg = RDLNetConfig(

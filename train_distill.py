@@ -37,6 +37,16 @@ from rdlnet.distill import (
 from rdlnet.sam_backbone import RDLNetSAMEncoder
 
 
+def pick_device() -> torch.device:
+    """Prefer CUDA, then Apple MPS, else CPU."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 def collate_distill(batch):
     imgs = torch.stack([b[0] for b in batch], dim=0)
     paths = [b[1] for b in batch]
@@ -64,13 +74,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=4.0)
     p.add_argument("--weight-kl", type=float, default=1.0)
     p.add_argument("--weight-md", type=float, default=1.0)
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    device = torch.device(args.device)
+    device = pick_device()
     print(f"device => {device}")
 
     ds = DistillImageFolder(args.image_dir, img_size=args.img_size)
