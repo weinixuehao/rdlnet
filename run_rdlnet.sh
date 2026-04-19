@@ -25,7 +25,7 @@ exec python train_rdlnet.py \
   --rwmd-root "${RWMD_ROOT:-dataset/RWMD_preprocessed/train_resize}" \
   --num-classes 2 \
   --distill-checkpoint checkpoints/distill_stage1.pt \
-  --output checkpoints/rdlnet.pt \
+  --output output/rdlnet/rdlnet.pt \
   --epochs 50 \
   --batch-size 2 \
   --num-workers 4 \
