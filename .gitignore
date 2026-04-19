@@ -7,5 +7,9 @@ data/raw/
 .vscode
 .tmp_pypdf
 __pycache__/
-dataset/
+# Dataset blobs stay local; track RWMD preprocessing helper only.
+dataset/*
+!dataset/RWMD_dataset/
+dataset/RWMD_dataset/*
+!dataset/RWMD_dataset/data_preprocessing_rwdm_1.py
 output
