@@ -32,6 +32,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from rdlnet.data import DistillImageFolder
+from rdlnet.device import pick_device
 from rdlnet.distill import (
     DistillConfig,
     LightSAMMultiplexDistillation,
@@ -40,16 +41,6 @@ from rdlnet.distill import (
     load_distill_trainable_state_dict,
 )
 from rdlnet.sam_backbone import RDLNetSAMEncoder
-
-
-def pick_device() -> torch.device:
-    """Prefer CUDA, then Apple MPS, else CPU."""
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    mps = getattr(torch.backends, "mps", None)
-    if mps is not None and mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
 
 def print_runtime_context(

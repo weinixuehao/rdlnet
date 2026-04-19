@@ -42,6 +42,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from rdlnet.data import DocLocalizationJsonDataset, RWMDLabelMeDataset, collate_doc_batch
+from rdlnet.device import pick_device
 from rdlnet.distill import load_student_encoder_into_rdlnet_from_checkpoint
 from rdlnet.losses import RDLNetLoss, build_matcher
 from rdlnet.model import RDLNet, RDLNetConfig
@@ -118,16 +119,6 @@ def save_loss_plot_png(
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=150)
     plt.close(fig)
-
-
-def pick_device() -> torch.device:
-    """Prefer CUDA, then Apple MPS, else CPU."""
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    mps = getattr(torch.backends, "mps", None)
-    if mps is not None and mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
 
 def parse_args() -> argparse.Namespace:
