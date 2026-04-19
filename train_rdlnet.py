@@ -12,12 +12,11 @@ Example (manifest JSON)::
         --distill-checkpoint checkpoints/distill_stage1.pt \\
         --output checkpoints/rdlnet.pt
 
-Example (RWMD LabelMe tree, e.g. ``RWMD_dataset_v1``)::
+Example (RWMD preprocessed ``train_resize`` from ``data_preprocessing_rwdm_1``)::
 
     python train_rdlnet.py \\
-        --rwmd-root dataset/RWMD_dataset/RWMD_dataset_v1 \\
+        --rwmd-root path/to/out/train_resize \\
         --num-classes 2 \\
-        --rwmd-label-mode main_bg \\
         --distill-checkpoint checkpoints/distill_stage1.pt \\
         --output checkpoints/rdlnet.pt
 
@@ -129,27 +128,13 @@ def parse_args() -> argparse.Namespace:
         "--rwmd-root",
         type=str,
         default=None,
-        help="RWMD LabelMe root (recursive *.json). If set, --annotations/--image-root are not used.",
+        help="RWMD preprocessed folder: img/, mask/, label_points_resize.json (see data_preprocessing_rwdm_1.py).",
     )
     p.add_argument(
         "--num-classes",
         type=int,
         default=None,
-        help="Override RDLNetConfig.num_classes (use 2 with RWMD --rwmd-label-mode main_bg; 9 only for folder scene id)",
-    )
-    p.add_argument(
-        "--rwmd-label-mode",
-        type=str,
-        choices=["main_bg", "folder", "layer", "zero"],
-        default="main_bg",
-        help="RWMD: main vs bg (foreground_doc vs digits), scene folder id, layer id mod K, or all 0",
-    )
-    p.add_argument(
-        "--rwmd-instance-order",
-        type=str,
-        choices=["foreground_first", "numeric_then_foreground", "json_order"],
-        default="foreground_first",
-        help="RWMD: which polygons to keep when truncating to num_queries",
+        help="Override RDLNetConfig.num_classes (RWMD preprocessed typically uses 2: top sheet vs other)",
     )
     p.add_argument(
         "--distill-checkpoint",
@@ -215,7 +200,7 @@ def main() -> None:
 
     if args.num_classes is not None:
         num_classes = args.num_classes
-    elif args.rwmd_root and args.rwmd_label_mode == "main_bg":
+    elif args.rwmd_root:
         num_classes = 2
     else:
         num_classes = 3
@@ -236,8 +221,6 @@ def main() -> None:
             num_classes=cfg.num_classes,
             num_points=cfg.num_points,
             max_instances=cfg.num_queries,
-            label_mode=args.rwmd_label_mode,
-            instance_order=args.rwmd_instance_order,
         )
     else:
         if not args.annotations or not args.image_root:
@@ -340,7 +323,6 @@ def main() -> None:
                     [t.detach().cpu() for t in tgt_points],
                     max_samples=args.viz_samples,
                 )
-                tqdm.write(f"Saved train viz grid -> {viz_path}")
             if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
                 torch.save(
                     {

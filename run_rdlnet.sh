@@ -1,5 +1,5 @@
 #!/bin/sh
-# Stage-2 RDLNet training wrapper (repo root). RWMD LabelMe tree by default.
+# Stage-2 RDLNet training wrapper (repo root). Set RWMD_ROOT to preprocessed train_resize (see data_preprocessing_rwdm_1.py).
 #
 # Usage:
 #   ./run_rdlnet.sh
@@ -22,9 +22,8 @@ if [ -n "${RESUME:-}" ]; then
 fi
 
 exec python train_rdlnet.py \
-  --rwmd-root dataset/RWMD_dataset/RWMD_dataset_v1 \
+  --rwmd-root "${RWMD_ROOT:-dataset/RWMD_preprocessed/train_resize}" \
   --num-classes 2 \
-  --rwmd-label-mode main_bg \
   --distill-checkpoint checkpoints/distill_stage1.pt \
   --output checkpoints/rdlnet.pt \
   --epochs 50 \

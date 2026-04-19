@@ -23,29 +23,27 @@ Example ``annotations.json`` (list of records)::
 - ``points``: length ``num_points * 2``, normalized coordinates ``x,y`` in ``[0, 1]`` in **original** image space;
   unused pairs can be zeros (e.g. 4 corners + padding for 9 points).
 
-RWMD (LabelMe-style) folders such as ``RWMD_dataset_v1`` can be loaded directly with
-:class:`RWMDLabelMeDataset` — polygons are rasterized on the fly and quadrilateral
-corners are derived from the annotation (4-point polygon or axis-aligned bounding box).
+RWMD offline data: :class:`RWMDLabelMeDataset` expects ``img/*.png``, ``mask/*.png`` (instance ids),
+and ``label_points_resize.json`` from ``data_preprocessing_rwdm_1.run_rwmd_preprocess``.
 
-Semantic **class** in RDLNet is the document role (e.g. primary vs background sheets), not
-the dataset's scene folder. Use ``label_mode="main_bg"`` with ``num_classes=2``: ``foreground_doc``
-→ 0, numeric ``"1"``/``"2"``/… layer labels → 1. Scene folders are only a data collection layout.
+Semantic **class** (use ``num_classes=2``): largest instance id in the mask → 0 (top sheet), others → 1.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Sequence, Union
+from typing import Any, Dict, List, Sequence, Union
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageDraw
+from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from .rwmd_exif_points import align_labelme_points_xy, load_rgb_exif_aligned
+from .rwmd_exif_points import load_rgb_exif_aligned
 
 
 def _load_pil_rgb_exif(path: Union[str, Path]) -> Image.Image:
@@ -154,18 +152,6 @@ class DocLocalizationJsonDataset(Dataset):
         }
 
 
-def _rwmd_rasterize_polygon(w: int, h: int, points_xy: Sequence[Sequence[float]]) -> Tensor:
-    """Binary mask [H,W] in {0,1} float32 from a closed polygon in pixel coordinates."""
-    if len(points_xy) < 3:
-        return torch.zeros(h, w, dtype=torch.float32)
-    mask = Image.new("L", (w, h), 0)
-    draw = ImageDraw.Draw(mask)
-    flat = [(float(p[0]), float(p[1])) for p in points_xy]
-    draw.polygon(flat, outline=255, fill=255)
-    m = torch.from_numpy(np.asarray(mask, dtype=np.float32)) / 255.0
-    return (m > 0.5).float()
-
-
 def _rwmd_strip_closing_vertex(points_xy: Sequence[Sequence[float]]) -> np.ndarray:
     """
     LabelMe often stores a closed polygon with the first vertex repeated at the end.
@@ -204,90 +190,32 @@ def _rwmd_flatten_points_norm(quad_xy: np.ndarray, w0: int, h0: int, num_points:
     return torch.from_numpy(pts.reshape(-1))
 
 
-def _rwmd_resolve_image_path(json_path: Path, labelme: Dict[str, Any]) -> Path:
-    d = json_path.parent
-    ip = labelme.get("imagePath")
-    if isinstance(ip, str) and ip:
-        p = d / ip
-        if p.is_file():
-            return p
-    stem = json_path.stem
-    for ext in (".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"):
-        p = d / (stem + ext)
-        if p.is_file():
-            return p
-    raise FileNotFoundError(f"No image file next to {json_path}")
+def _rwmd_quad_from_instance_mask(binary_hw: np.ndarray) -> np.ndarray:
+    """Axis-aligned quad (4,2) float32 from a boolean/float mask [H,W]."""
+    ys, xs = np.where(binary_hw > 0.5)
+    if xs.size == 0:
+        return np.zeros((4, 2), dtype=np.float32)
+    x0, x1 = float(xs.min()), float(xs.max())
+    y0, y1 = float(ys.min()), float(ys.max())
+    return np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
 
 
-def _rwmd_order_shapes(
-    shapes: List[Dict[str, Any]],
-    order: Literal["foreground_first", "numeric_then_foreground", "json_order"],
-) -> List[Dict[str, Any]]:
-    fg: List[Dict[str, Any]] = []
-    num: List[Dict[str, Any]] = []
-    for s in shapes:
-        lab = s.get("label")
-        if lab == "foreground_doc":
-            fg.append(s)
-        elif isinstance(lab, str) and lab.isdigit():
-            num.append(s)
-    num.sort(key=lambda s: int(s["label"]))
-
-    if order == "foreground_first":
-        ordered = fg + num
-    elif order == "numeric_then_foreground":
-        ordered = num + fg
-    else:
-        ordered = [s for s in shapes if s.get("label") == "foreground_doc" or (isinstance(s.get("label"), str) and s["label"].isdigit())]
-    return ordered
-
-
-def _rwmd_instance_class(
-    shape: Dict[str, Any],
-    *,
-    label_mode: Literal["folder", "layer", "zero", "main_bg"],
-    folder_class: int,
-    num_classes: int,
-) -> int:
-    if label_mode == "zero":
+def _rwmd_main_bg_class(inst_id: int, fore_idx: int, num_classes: int) -> int:
+    """Top sheet (``inst_id == fore_idx``) → 0; other instances → 1."""
+    if num_classes < 2:
         return 0
-    lab = shape.get("label")
-    if label_mode == "folder":
-        return int(folder_class) % max(num_classes, 1)
-    if label_mode == "main_bg":
-        # Paper-style: primary document vs background documents; digit strings are stacking layers.
-        if lab == "foreground_doc":
-            return 0
-        if num_classes < 2:
-            return 0
-        if isinstance(lab, str) and lab.isdigit():
-            return 1
-        return 1
-    # layer: map layer index (digit - 1) modulo num_classes (not main-vs-bg).
-    if lab == "foreground_doc":
-        return 0
-    if isinstance(lab, str) and lab.isdigit():
-        k = int(lab) - 1
-        if num_classes <= 0:
-            return 0
-        return int(k % num_classes)
-    return 0
+    return 0 if inst_id == fore_idx else 1
 
 
 class RWMDLabelMeDataset(Dataset):
     """
-    Load RWMD-style LabelMe JSON (``shapes`` with ``foreground_doc`` and numeric labels).
+    Preprocessed RWMD layout from ``run_rwmd_preprocess`` (see ``data_preprocessing_rwdm_1.py``):
 
-    Each polygon becomes one instance: binary mask from the polygon fill, and
-    ``num_points`` keypoints with the first four corners normalized to ``[0,1]`` (quad from
-    the annotation if it has 4 vertices, else axis-aligned bounding box of the polygon).
+    - ``img/*.png`` — RGB images (BGR on disk from OpenCV; we convert when loading).
+    - ``mask/*.png`` — uint8 instance ids (largest id = top sheet).
+    - ``label_points_resize.json`` — ``foreground_doc`` polygon per basename for quad targets.
 
-    **Label modes:** ``main_bg`` (default) assigns class 0 to ``foreground_doc`` and 1 to numeric
-    layers (background documents), matching RDLNet's document-role semantics. ``folder`` uses the
-    parent directory name as a coarse scene id (not the same as paper ``num_classes``).
-
-    **Truncation:** ``max_instances`` (typically ``num_queries``) keeps the first shapes
-    after ordering — use ``foreground_first`` to prioritize the foreground quadrilateral.
+    **Classes:** top sheet (max instance id) → 0; others → 1 (use ``num_classes=2``).
     """
 
     def __init__(
@@ -297,9 +225,6 @@ class RWMDLabelMeDataset(Dataset):
         num_classes: int,
         num_points: int,
         max_instances: int,
-        label_mode: Literal["folder", "layer", "zero", "main_bg"] = "main_bg",
-        instance_order: Literal["foreground_first", "numeric_then_foreground", "json_order"] = "foreground_first",
-        json_paths: Optional[List[Path]] = None,
     ) -> None:
         super().__init__()
         self.rwmd_root = Path(rwmd_root).resolve()
@@ -308,78 +233,84 @@ class RWMDLabelMeDataset(Dataset):
         self.num_points = num_points
         self.max_instances = max_instances
         self.point_dim = num_points * 2
-        self.label_mode = label_mode
-        self.instance_order = instance_order
 
-        if json_paths is not None:
-            self.json_paths = [Path(p).resolve() for p in json_paths]
-        else:
-            self.json_paths = sorted(self.rwmd_root.rglob("*.json"))
-        if not self.json_paths:
-            raise ValueError(f"No JSON files under {self.rwmd_root}")
-
-        folder_names = sorted({p.parent.name for p in self.json_paths})
-        self._folder_to_id = {name: i for i, name in enumerate(folder_names)}
+        img_dir = self.rwmd_root / "img"
+        lp = self.rwmd_root / "label_points_resize.json"
+        if not img_dir.is_dir():
+            raise ValueError(f"RWMDLabelMeDataset expects directory {img_dir}/")
+        if not lp.is_file():
+            raise ValueError(f"RWMDLabelMeDataset expects {lp}")
+        self._img_paths = sorted(img_dir.glob("*.png"))
+        if not self._img_paths:
+            raise ValueError(f"No PNG files in {img_dir}")
+        with open(lp, "r", encoding="utf-8") as f:
+            self._label_points_resize: Dict[str, Any] = json.load(f)
 
     def __len__(self) -> int:
-        return len(self.json_paths)
+        return len(self._img_paths)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        json_path = self.json_paths[idx]
-        with open(json_path, "r", encoding="utf-8") as f:
-            labelme = json.load(f)
-        shapes = labelme.get("shapes") or []
-        path = _rwmd_resolve_image_path(json_path, labelme)
+        path_img = self._img_paths[idx]
+        path_mask = self.rwmd_root / "mask" / path_img.name
+        if not path_mask.is_file():
+            raise FileNotFoundError(path_mask)
 
-        im_raw, im_aligned = load_rgb_exif_aligned(path)
-        w0, h0 = im_aligned.size
-        im = im_aligned.resize((self.img_size, self.img_size), Image.BICUBIC)
-        image = torch.from_numpy(np.asarray(im).copy()).float().permute(2, 0, 1)
+        img_bgr = cv2.imread(str(path_img), cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            raise FileNotFoundError(path_img)
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        h0, w0 = img_rgb.shape[0], img_rgb.shape[1]
 
-        folder_class = self._folder_to_id.get(json_path.parent.name, 0)
-        ordered = _rwmd_order_shapes(shapes, self.instance_order)
+        m_u8 = cv2.imread(str(path_mask), cv2.IMREAD_GRAYSCALE)
+        if m_u8 is None:
+            raise FileNotFoundError(path_mask)
+
+        ids = sorted(int(x) for x in np.unique(m_u8) if int(x) > 0)
+        if not ids:
+            labels_t = torch.zeros(0, dtype=torch.long)
+            masks_t = torch.zeros(0, self.img_size, self.img_size)
+            points_t = torch.zeros(0, self.point_dim)
+            im = Image.fromarray(img_rgb).resize((self.img_size, self.img_size), Image.BICUBIC)
+            image = torch.from_numpy(np.asarray(im).copy()).float().permute(2, 0, 1)
+            return {"image": image, "labels": labels_t, "masks": masks_t, "points": points_t, "path": str(path_img)}
+
+        fore_idx = max(ids)
+
+        fg_raw = self._label_points_resize.get(path_img.name) or self._label_points_resize.get(path_img.stem, [])
 
         labels: List[int] = []
         masks: List[Tensor] = []
         points: List[Tensor] = []
 
-        for shape in ordered[: self.max_instances]:
-            pts = shape.get("points")
-            if not isinstance(pts, list) or len(pts) < 3:
-                continue
-            pts = align_labelme_points_xy(pts, im_raw, im_aligned, labelme)
-            m = _rwmd_rasterize_polygon(w0, h0, pts)
-            m = m.unsqueeze(0)
+        for inst_id in ids[: self.max_instances]:
+            bin_np = (m_u8 == inst_id).astype(np.float32)
+            m = torch.from_numpy(bin_np).unsqueeze(0)
             m = F.interpolate(m.unsqueeze(0), size=(self.img_size, self.img_size), mode="nearest").squeeze(0).squeeze(0)
             masks.append(m)
 
-            quad = _rwmd_quad_corners_xy(pts)
+            if inst_id == fore_idx and isinstance(fg_raw, list) and len(fg_raw) >= 3:
+                quad = _rwmd_quad_corners_xy(fg_raw)
+            else:
+                quad = _rwmd_quad_from_instance_mask(bin_np)
             pt = _rwmd_flatten_points_norm(quad, w0, h0, self.num_points)
             points.append(pt)
 
-            lab = _rwmd_instance_class(
-                shape,
-                label_mode=self.label_mode,
-                folder_class=folder_class,
-                num_classes=self.num_classes,
-            )
+            lab = _rwmd_main_bg_class(inst_id, fore_idx, self.num_classes)
             if not (0 <= lab < self.num_classes):
                 raise ValueError(f"label {lab} out of range [0, {self.num_classes})")
             labels.append(lab)
 
-        if not labels:
-            labels_t = torch.zeros(0, dtype=torch.long)
-            masks_t = torch.zeros(0, self.img_size, self.img_size)
-            points_t = torch.zeros(0, self.point_dim)
-        else:
-            labels_t = torch.tensor(labels, dtype=torch.long)
-            masks_t = torch.stack(masks, dim=0)
-            points_t = torch.stack(points, dim=0)
+        im = Image.fromarray(img_rgb).resize((self.img_size, self.img_size), Image.BICUBIC)
+        image = torch.from_numpy(np.asarray(im).copy()).float().permute(2, 0, 1)
+
+        labels_t = torch.tensor(labels, dtype=torch.long)
+        masks_t = torch.stack(masks, dim=0)
+        points_t = torch.stack(points, dim=0)
 
         return {
             "image": image,
             "labels": labels_t,
             "masks": masks_t,
             "points": points_t,
-            "path": str(path),
+            "path": str(path_img),
         }
