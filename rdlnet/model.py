@@ -240,7 +240,9 @@ class RDLNet(nn.Module):
             flat = t.flatten(2).transpose(1, 2)
             out.append(flat + self.level_embed[i].view(1, 1, -1))
         src = torch.cat(out, dim=1)
-        start = torch.cat([torch.tensor([0], device=feat.device), torch.tensor([s[0] * s[1] for s in spatial_shapes]).cumsum(0)[:-1]])
+        dev, dt = feat.device, torch.long
+        lvl_counts = torch.tensor([s[0] * s[1] for s in spatial_shapes], device=dev, dtype=dt)
+        start = torch.cat([torch.zeros(1, device=dev, dtype=dt), lvl_counts.cumsum(0)[:-1]])
         return src, spatial_shapes, start
 
     def _encoder_reference_points(

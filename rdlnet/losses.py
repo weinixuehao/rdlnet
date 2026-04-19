@@ -72,7 +72,7 @@ class HungarianMatcher(nn.Module):
     ) -> List[Tuple[Tensor, Tensor]]:
         """
         pred_*: batched predictions [B, Nq, ...].
-        tgt_*: list length B of [Ni], [Ni,H,W], [Ni, P*2].
+        tgt_*: list length B of [Ni], [Ni,H,W], [Ni, P*2] on the **same device** as ``pred_logits``.
         Returns list of (src_idx, tgt_idx) per image.
         """
         b, nq, _ = pred_logits.shape
@@ -101,7 +101,7 @@ class HungarianMatcher(nn.Module):
 
             # point L1 cost [Nq, Nt]
             if self.cfg.ignore_padded_points:
-                m = _points_valid_mask_from_padding(tp, eps=float(self.cfg.padded_point_eps)).to(pred_points.device)
+                m = _points_valid_mask_from_padding(tp, eps=float(self.cfg.padded_point_eps))
                 cost_p = _masked_l1_cost(pred_points[i], tp, m)
             else:
                 cost_p = torch.cdist(pred_points[i], tp, p=1)
@@ -143,6 +143,7 @@ class RDLNetLoss(nn.Module):
         tgt_masks: List[Tensor],
         tgt_points: List[Tensor],
     ) -> Tuple[Tensor, Dict[str, Tensor]]:
+        """``tgt_*`` must live on the same device as ``pred_logits`` (e.g. moved in the training loop)."""
         b, nq, _ = pred_logits.shape
         device = pred_logits.device
         self.empty_weight = self.empty_weight.to(device)
@@ -178,7 +179,7 @@ class RDLNetLoss(nn.Module):
             pp = pred_points[i][src_i]
             tp = tgt_points[i][tgt_i]
             if self.cfg.ignore_padded_points:
-                m = _points_valid_mask_from_padding(tp, eps=float(self.cfg.padded_point_eps)).to(pp.device)
+                m = _points_valid_mask_from_padding(tp, eps=float(self.cfg.padded_point_eps))
                 diff = (pp - tp).abs() * m
                 den = m.sum(dim=-1).clamp_min(1.0)
                 loss_dist = loss_dist + (diff.sum(dim=-1) / den).mean()

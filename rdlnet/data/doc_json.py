@@ -26,6 +26,10 @@ Example ``annotations.json`` (list of records)::
 RWMD (LabelMe-style) folders such as ``RWMD_dataset_v1`` can be loaded directly with
 :class:`RWMDLabelMeDataset` — polygons are rasterized on the fly and quadrilateral
 corners are derived from the annotation (4-point polygon or axis-aligned bounding box).
+
+Semantic **class** in RDLNet is the document role (e.g. primary vs background sheets), not
+the dataset's scene folder. Use ``label_mode="main_bg"`` with ``num_classes=2``: ``foreground_doc``
+→ 0, numeric ``"1"``/``"2"``/… layer labels → 1. Scene folders are only a data collection layout.
 """
 
 from __future__ import annotations
@@ -241,7 +245,7 @@ def _rwmd_order_shapes(
 def _rwmd_instance_class(
     shape: Dict[str, Any],
     *,
-    label_mode: Literal["folder", "layer", "zero"],
+    label_mode: Literal["folder", "layer", "zero", "main_bg"],
     folder_class: int,
     num_classes: int,
 ) -> int:
@@ -250,7 +254,16 @@ def _rwmd_instance_class(
     lab = shape.get("label")
     if label_mode == "folder":
         return int(folder_class) % max(num_classes, 1)
-    # layer
+    if label_mode == "main_bg":
+        # Paper-style: primary document vs background documents; digit strings are stacking layers.
+        if lab == "foreground_doc":
+            return 0
+        if num_classes < 2:
+            return 0
+        if isinstance(lab, str) and lab.isdigit():
+            return 1
+        return 1
+    # layer: map layer index (digit - 1) modulo num_classes (not main-vs-bg).
     if lab == "foreground_doc":
         return 0
     if isinstance(lab, str) and lab.isdigit():
@@ -269,6 +282,10 @@ class RWMDLabelMeDataset(Dataset):
     ``num_points`` keypoints with the first four corners normalized to ``[0,1]`` (quad from
     the annotation if it has 4 vertices, else axis-aligned bounding box of the polygon).
 
+    **Label modes:** ``main_bg`` (default) assigns class 0 to ``foreground_doc`` and 1 to numeric
+    layers (background documents), matching RDLNet's document-role semantics. ``folder`` uses the
+    parent directory name as a coarse scene id (not the same as paper ``num_classes``).
+
     **Truncation:** ``max_instances`` (typically ``num_queries``) keeps the first shapes
     after ordering — use ``foreground_first`` to prioritize the foreground quadrilateral.
     """
@@ -280,7 +297,7 @@ class RWMDLabelMeDataset(Dataset):
         num_classes: int,
         num_points: int,
         max_instances: int,
-        label_mode: Literal["folder", "layer", "zero"] = "folder",
+        label_mode: Literal["folder", "layer", "zero", "main_bg"] = "main_bg",
         instance_order: Literal["foreground_first", "numeric_then_foreground", "json_order"] = "foreground_first",
         json_paths: Optional[List[Path]] = None,
     ) -> None:
