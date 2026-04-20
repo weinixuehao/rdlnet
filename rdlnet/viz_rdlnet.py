@@ -6,7 +6,7 @@ Preprocessed RWMD GT check: ``python -m rdlnet.viz_rdlnet --rwmd-root path/to/tr
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -161,11 +161,16 @@ def save_train_compare_grid(
     max_samples: int = 4,
     mask_thresh: float = 0.5,
     n_corner_vis: int = 4,
+    matched_indices: Optional[List[Tuple[Tensor, Tensor]]] = None,
 ) -> None:
     """
     Save a grid: columns = [RGB | GT masks+points | pred masks+points], rows = batch samples.
 
     ``out`` must contain ``pred_masks`` (logits B×Nq×H×W) and ``pred_points`` (sigmoid B×Nq×(P*2)).
+
+    If ``matched_indices`` is set (same bipartite matching as training: one (src_idx, tgt_idx) per
+    image), the pred column only overlays **queries matched to a ground-truth instance**, in GT
+    index order (colors align with the GT column). If ``None``, all queries are drawn (legacy).
     """
     import matplotlib
 
@@ -197,8 +202,25 @@ def save_train_compare_grid(
 
         pm = pred_prob[i].numpy()
         nq = int(pm.shape[0])
-        pred_layers = [_resize_mask_to_hw(pm[q], h, w) for q in range(nq)]
-        pred_vis = _blend_instances(rgb.copy(), pred_layers, mask_thresh=mask_thresh)
+        ppts = pred_points[i].numpy()
+
+        use_match = matched_indices is not None and i < len(matched_indices)
+        if use_match:
+            src_i, tgt_i = matched_indices[i]
+            src_i = src_i.long().view(-1)
+            tgt_i = tgt_i.long().view(-1)
+            if tgt_i.numel() == 0:
+                pred_vis = rgb.copy()
+                pred_title = "pred (0 matched)"
+            else:
+                pairs = sorted(zip(src_i.tolist(), tgt_i.tolist()), key=lambda p: p[1])
+                pred_layers = [_resize_mask_to_hw(pm[int(s)], h, w) for s, _ in pairs]
+                pred_vis = _blend_instances(rgb.copy(), pred_layers, mask_thresh=mask_thresh)
+                pred_title = f"pred ({len(pairs)} matched)"
+        else:
+            pred_layers = [_resize_mask_to_hw(pm[q], h, w) for q in range(nq)]
+            pred_vis = _blend_instances(rgb.copy(), pred_layers, mask_thresh=mask_thresh)
+            pred_title = f"pred ({nq} q.)"
 
         axes[i, 0].imshow(rgb)
         axes[i, 0].set_title("image")
@@ -212,11 +234,16 @@ def save_train_compare_grid(
             _draw_quad_corners(axes[i, 1], tpts[j], h, w, f"C{j % 10}", n_corner_vis)
 
         axes[i, 2].imshow(pred_vis)
-        axes[i, 2].set_title(f"pred ({nq} q.)")
+        axes[i, 2].set_title(pred_title)
         axes[i, 2].axis("off")
-        ppts = pred_points[i].numpy()
-        for q in range(nq):
-            _draw_quad_corners(axes[i, 2], ppts[q], h, w, f"C{q % 10}", n_corner_vis)
+        if use_match:
+            if tgt_i.numel() > 0:
+                pairs = sorted(zip(src_i.tolist(), tgt_i.tolist()), key=lambda p: p[1])
+                for s, tj in pairs:
+                    _draw_quad_corners(axes[i, 2], ppts[int(s)], h, w, f"C{tj % 10}", n_corner_vis)
+        else:
+            for q in range(nq):
+                _draw_quad_corners(axes[i, 2], ppts[q], h, w, f"C{q % 10}", n_corner_vis)
 
     fig.suptitle("RDLNet: image | ground truth | prediction", fontsize=11, y=1.02)
     fig.tight_layout()

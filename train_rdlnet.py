@@ -158,6 +158,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument(
+        "--grad-clip-norm",
+        type=float,
+        default=1.0,
+        help="Clip gradient L2 norm before optimizer step (0 disables). Helps avoid mask BCE blow-ups.",
+    )
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--img-size", type=int, default=1024)
     p.add_argument("--num-workers", type=int, default=4)
@@ -187,7 +193,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--viz-every-steps",
         type=int,
-        default=20,
+        default=30,
         help="Save train viz grid every N global steps (current batch); 0 disables",
     )
     return p.parse_args()
@@ -301,6 +307,8 @@ def main() -> None:
             )
             opt.zero_grad(set_to_none=True)
             loss.backward()
+            if args.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
             opt.step()
             epoch_loss += float(loss.detach())
             sum_cls += float(logs["loss_cls"].item())
@@ -315,6 +323,16 @@ def main() -> None:
                 and global_step % args.viz_every_steps == 0
             ):
                 viz_path = out_path.parent / f"{out_path.stem}_viz_s{global_step:08d}.png"
+                with torch.no_grad():
+                    _mi = criterion.matcher(
+                        out["pred_logits"],
+                        out["pred_masks"],
+                        out["pred_points"],
+                        tgt_labels,
+                        tgt_masks,
+                        tgt_points,
+                    )
+                matched_indices = [(a.cpu(), b.cpu()) for a, b in _mi]
                 save_train_compare_grid(
                     viz_path,
                     images.detach().cpu(),
@@ -322,6 +340,7 @@ def main() -> None:
                     [t.detach().cpu() for t in tgt_masks],
                     [t.detach().cpu() for t in tgt_points],
                     max_samples=args.viz_samples,
+                    matched_indices=matched_indices,
                 )
             if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
                 torch.save(

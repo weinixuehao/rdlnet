@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env sh
 # Stage-2 RDLNet training wrapper (repo root). Set RWMD_ROOT to preprocessed train_resize (see data_preprocessing_rwdm_1.py).
 #
 # Usage:
@@ -8,6 +8,8 @@
 #   RESUME=checkpoints/rdlnet.pt ./run_rdlnet.sh --epochs 10
 #
 # Do not set RESUME and also pass --resume (duplicate flags).
+#
+# Requires LF line endings (Unix). On macOS and Ubuntu, prefer .venv/bin/python when present.
 
 set -eu
 cd "$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
@@ -26,7 +28,8 @@ exec python train_rdlnet.py \
   --num-classes 2 \
   --distill-checkpoint checkpoints/distill_stage1.pt \
   --output output/rdlnet/rdlnet.pt \
-  --epochs 50 \
+  --epochs 200 \
   --batch-size 2 \
   --num-workers 4 \
+  --ignore-padded-points \
   "$@"
