@@ -159,6 +159,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument(
+        "--amp",
+        action="store_true",
+        help="Enable CUDA automatic mixed precision (AMP) training via autocast + GradScaler",
+    )
+    p.add_argument(
+        "--amp-dtype",
+        type=str,
+        default="bf16",
+        choices=["bf16", "fp16"],
+        help="AMP autocast dtype when --amp is set (bf16 is recommended when supported)",
+    )
+    p.add_argument(
         "--grad-clip-norm",
         type=float,
         default=1.0,
@@ -252,6 +264,11 @@ def main() -> None:
     matcher = build_matcher(cfg)
     criterion = RDLNetLoss(cfg, matcher)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    use_amp = bool(args.amp and device.type == "cuda")
+    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    if args.amp and not use_amp:
+        print("WARN: --amp requested but CUDA is not available; AMP disabled.")
 
     hist_ep: list[int] = []
     hist_loss: list[float] = []
@@ -296,20 +313,35 @@ def main() -> None:
             tgt_labels = [t.to(device) for t in batch["tgt_labels"]]
             tgt_masks = [t.to(device) for t in batch["tgt_masks"]]
             tgt_points = [t.to(device) for t in batch["tgt_points"]]
-            out = model(images)
-            loss, logs = criterion(
-                out["pred_logits"],
-                out["pred_masks"],
-                out["pred_points"],
-                tgt_labels,
-                tgt_masks,
-                tgt_points,
-            )
             opt.zero_grad(set_to_none=True)
-            loss.backward()
-            if args.grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
-            opt.step()
+            with torch.amp.autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
+                out = model(images)
+                loss, logs = criterion(
+                    out["pred_logits"],
+                    out["pred_masks"],
+                    out["pred_points"],
+                    tgt_labels,
+                    tgt_masks,
+                    tgt_points,
+                )
+            if not torch.isfinite(loss).item():
+                tqdm.write(f"WARN: non-finite loss at step={global_step} (loss={float(loss.detach().cpu())}); skipping update")
+                opt.zero_grad(set_to_none=True)
+                if use_amp:
+                    scaler.update()
+                continue
+            if use_amp:
+                scaler.scale(loss).backward()
+                if args.grad_clip_norm > 0:
+                    scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                if args.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                opt.step()
             epoch_loss += float(loss.detach())
             sum_cls += float(logs["loss_cls"].item())
             sum_dist += float(logs["loss_dist"].item())
