@@ -41,15 +41,44 @@ def _strip_closing_vertex_xy(pts_xy: np.ndarray) -> np.ndarray:
 
 
 def _order_quad_tl_tr_br_bl(pts4_xy: np.ndarray) -> np.ndarray:
-    """Return 4 points ordered as TL, TR, BR, BL for perspective transform."""
-    p = np.asarray(pts4_xy, dtype=np.float32).reshape(4, 2)
-    s = p[:, 0] + p[:, 1]
-    d = p[:, 0] - p[:, 1]
-    tl = p[int(np.argmin(s))]
-    br = p[int(np.argmax(s))]
-    tr = p[int(np.argmin(d))]
-    bl = p[int(np.argmax(d))]
-    return np.stack([tl, tr, br, bl], axis=0)
+    """
+    Return 4 points ordered as TL, TR, BR, BL.
+
+    NOTE: The classic min/max of (x+y)/(x-y) heuristic can select the same vertex twice for
+    rotated / skewed quads. We instead sort by angle around centroid, rotate to TL, then
+    enforce TL->TR direction. If the quad degenerates (duplicate points / near-zero area),
+    raise to fail fast.
+    """
+    p = np.asarray(pts4_xy, dtype=np.float64).reshape(4, 2)
+
+    # Fail fast: duplicate vertices (or extremely close) indicate a broken quad.
+    eps = 1e-3
+    for i in range(4):
+        for j in range(i + 1, 4):
+            if float(np.hypot(p[i, 0] - p[j, 0], p[i, 1] - p[j, 1])) <= eps:
+                raise ValueError(f"quad has duplicate points: {p.tolist()}")
+
+    c = p.mean(axis=0)
+    ang = np.arctan2(p[:, 1] - c[1], p[:, 0] - c[0])
+    ordered = p[np.argsort(ang)]
+
+    # Rotate so the first point is TL (smallest x+y) in image coordinates.
+    k = int(np.argmin(ordered[:, 0] + ordered[:, 1]))
+    ordered = np.roll(ordered, -k, axis=0)
+
+    # Enforce TL->TR (second point should be more to the right than the 4th).
+    # If not, reverse the cycle direction while keeping TL fixed.
+    if ordered[1, 0] < ordered[3, 0]:
+        ordered = np.concatenate([ordered[:1], ordered[:0:-1]], axis=0)
+
+    # Fail fast: degenerate polygon area.
+    x = ordered[:, 0]
+    y = ordered[:, 1]
+    area2 = float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+    if abs(area2) <= 1e-2:
+        raise ValueError(f"quad area too small: {ordered.tolist()}")
+
+    return ordered.astype(np.float32)
 
 def _quantize_instance_mask_for_png(mask_u8: np.ndarray) -> np.ndarray:
     """
@@ -550,9 +579,7 @@ def resize_customdata(
 
         # Defensive: points should be list[[x,y], ...] (often length 4 for `foreground_doc` quad).
         if not isinstance(pts, list) or (len(pts) > 0 and (not isinstance(pts[0], (list, tuple)) or len(pts[0]) != 2)):
-            print(f"[WARN] bad label_points for {img_n}: type={type(pts).__name__} sample={str(pts)[:120]}")
-            json_save[img_n] = []
-            continue
+            raise ValueError(f"bad label_points for {img_n}: type={type(pts).__name__} sample={str(pts)[:200]}")
 
         point_scale = np.asarray(pts, dtype=np.float64) * scale
         json_save[img_n] = point_scale.tolist()
