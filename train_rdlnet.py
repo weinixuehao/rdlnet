@@ -45,7 +45,7 @@ from rdlnet.device import pick_device
 from rdlnet.distill import load_student_encoder_into_rdlnet_from_checkpoint
 from rdlnet.losses import RDLNetLoss, build_matcher
 from rdlnet.model import RDLNet, RDLNetConfig
-from rdlnet.viz_rdlnet import save_train_compare_grid
+from rdlnet.viz_rdlnet import train_compare_grid_u8
 
 LOSS_HISTORY_KEY = "train_rdlnet_loss_history"
 
@@ -205,6 +205,11 @@ def main() -> None:
     device = pick_device()
     print(f"device => {device}")
 
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except Exception as e:  # pragma: no cover
+        raise SystemExit(f"TensorBoard not available (install tensorboard). Import error: {e}") from e
+
     if args.num_classes is not None:
         num_classes = args.num_classes
     elif args.rwmd_root:
@@ -286,67 +291,31 @@ def main() -> None:
     loss_plot_path = Path(args.loss_plot) if args.loss_plot else out_path.with_name(out_path.stem + "_loss.png")
     print(f"loss plot (PNG) => {loss_plot_path}")
 
+    tb_logdir = out_path.parent / f"{out_path.stem}_tb"
+    tb_logdir.mkdir(parents=True, exist_ok=True)
+    print(f"tensorboard logdir => {tb_logdir}")
+
     end_epoch = start_epoch + args.epochs
-    for epoch in range(start_epoch, end_epoch):
-        model.train()
-        # Group frequent visualizations by epoch for easier browsing.
-        epoch_dir = out_path.parent / f"epoch_{epoch + 1:04d}"
-        epoch_dir.mkdir(parents=True, exist_ok=True)
-        epoch_loss = 0.0
-        sum_cls = 0.0
-        sum_dist = 0.0
-        sum_dice = 0.0
-        sum_mask = 0.0
-        n_batches = 0
-        for batch in tqdm(loader, desc=f"epoch {epoch + 1}/{end_epoch}", leave=True):
-            images = batch["images"].to(device)
-            tgt_labels = [t.to(device) for t in batch["tgt_labels"]]
-            tgt_masks = [t.to(device) for t in batch["tgt_masks"]]
-            tgt_points = [t.to(device) for t in batch["tgt_points"]]
-            opt.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
-                out = model(images)
-                loss, logs = criterion(
-                    out["pred_logits"],
-                    out["pred_masks"],
-                    out["pred_points"],
-                    tgt_labels,
-                    tgt_masks,
-                    tgt_points,
-                )
-            if not torch.isfinite(loss).item():
-                tqdm.write(f"WARN: non-finite loss at step={global_step} (loss={float(loss.detach().cpu())}); skipping update")
+    import numpy as np
+
+    with SummaryWriter(log_dir=str(tb_logdir)) as tb:
+        for epoch in range(start_epoch, end_epoch):
+            model.train()
+            epoch_loss = 0.0
+            sum_cls = 0.0
+            sum_dist = 0.0
+            sum_dice = 0.0
+            sum_mask = 0.0
+            n_batches = 0
+            for batch in tqdm(loader, desc=f"epoch {epoch + 1}/{end_epoch}", leave=True):
+                images = batch["images"].to(device)
+                tgt_labels = [t.to(device) for t in batch["tgt_labels"]]
+                tgt_masks = [t.to(device) for t in batch["tgt_masks"]]
+                tgt_points = [t.to(device) for t in batch["tgt_points"]]
                 opt.zero_grad(set_to_none=True)
-                if use_amp:
-                    scaler.update()
-                continue
-            if use_amp:
-                scaler.scale(loss).backward()
-                if args.grad_clip_norm > 0:
-                    scaler.unscale_(opt)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
-                scaler.step(opt)
-                scaler.update()
-            else:
-                loss.backward()
-                if args.grad_clip_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
-                opt.step()
-            epoch_loss += float(loss.detach())
-            sum_cls += float(logs["loss_cls"].item())
-            sum_dist += float(logs["loss_dist"].item())
-            sum_dice += float(logs["loss_dice"].item())
-            sum_mask += float(logs["loss_mask"].item())
-            n_batches += 1
-            global_step += 1
-            if (
-                args.viz_samples > 0
-                and args.viz_every_steps > 0
-                and global_step % args.viz_every_steps == 0
-            ):
-                viz_path = epoch_dir / f"{out_path.stem}_viz_s{global_step:08d}.png"
-                with torch.no_grad():
-                    _mi = criterion.matcher(
+                with torch.amp.autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
+                    out = model(images)
+                    loss, logs = criterion(
                         out["pred_logits"],
                         out["pred_masks"],
                         out["pred_points"],
@@ -354,30 +323,70 @@ def main() -> None:
                         tgt_masks,
                         tgt_points,
                     )
-                matched_indices = [(a.cpu(), b.cpu()) for a, b in _mi]
-                save_train_compare_grid(
-                    viz_path,
-                    images.detach().cpu(),
-                    {k: v.detach().cpu() for k, v in out.items()},
-                    [t.detach().cpu() for t in tgt_labels],
-                    [t.detach().cpu() for t in tgt_masks],
-                    [t.detach().cpu() for t in tgt_points],
-                    max_samples=args.viz_samples,
-                    matched_indices=matched_indices,
-                )
-            if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
-                torch.save(
-                    {
-                        "model": model.state_dict(),
-                        "optimizer": opt.state_dict(),
-                        "config": asdict(cfg),
-                        "epoch": epoch,
-                        "global_step": global_step,
-                        "note": "mid-epoch",
-                    },
-                    step_ckpt,
-                )
-                tqdm.write(f"Saved step checkpoint -> {step_ckpt}")
+                if not torch.isfinite(loss).item():
+                    tqdm.write(
+                        f"WARN: non-finite loss at step={global_step} (loss={float(loss.detach().cpu())}); skipping update"
+                    )
+                    opt.zero_grad(set_to_none=True)
+                    if use_amp:
+                        scaler.update()
+                    continue
+                if use_amp:
+                    scaler.scale(loss).backward()
+                    if args.grad_clip_norm > 0:
+                        scaler.unscale_(opt)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                    scaler.step(opt)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    if args.grad_clip_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                    opt.step()
+                epoch_loss += float(loss.detach())
+                sum_cls += float(logs["loss_cls"].item())
+                sum_dist += float(logs["loss_dist"].item())
+                sum_dice += float(logs["loss_dice"].item())
+                sum_mask += float(logs["loss_mask"].item())
+                n_batches += 1
+                global_step += 1
+
+                if args.viz_samples > 0 and args.viz_every_steps > 0 and global_step % args.viz_every_steps == 0:
+                    with torch.no_grad():
+                        _mi = criterion.matcher(
+                            out["pred_logits"],
+                            out["pred_masks"],
+                            out["pred_points"],
+                            tgt_labels,
+                            tgt_masks,
+                            tgt_points,
+                        )
+                    matched_indices = [(a.cpu(), b.cpu()) for a, b in _mi]
+                    grid_u8 = train_compare_grid_u8(
+                        images.detach().cpu(),
+                        {k: v.detach().cpu() for k, v in out.items()},
+                        [t.detach().cpu() for t in tgt_labels],
+                        [t.detach().cpu() for t in tgt_masks],
+                        [t.detach().cpu() for t in tgt_points],
+                        max_samples=args.viz_samples,
+                        matched_indices=matched_indices,
+                    )
+                    chw = np.transpose(grid_u8, (2, 0, 1))
+                    tb.add_image("train/compare_grid", chw, global_step=global_step, dataformats="CHW")
+
+                if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
+                    torch.save(
+                        {
+                            "model": model.state_dict(),
+                            "optimizer": opt.state_dict(),
+                            "config": asdict(cfg),
+                            "epoch": epoch,
+                            "global_step": global_step,
+                            "note": "mid-epoch",
+                        },
+                        step_ckpt,
+                    )
+                    tqdm.write(f"Saved step checkpoint -> {step_ckpt}")
 
         nb = max(n_batches, 1)
         avg = epoch_loss / nb

@@ -222,8 +222,7 @@ def annotations_viz_grid_u8(
     return out
 
 
-def save_train_compare_grid(
-    path: Path | str,
+def train_compare_grid_u8(
     images: Tensor,
     out: Dict[str, Tensor],
     tgt_labels: List[Tensor],
@@ -234,26 +233,17 @@ def save_train_compare_grid(
     mask_thresh: float = 0.5,
     n_corner_vis: int = 4,
     matched_indices: Optional[List[Tuple[Tensor, Tensor]]] = None,
-) -> None:
-    """
-    Save a grid: columns = [RGB | GT masks+points | pred masks+points], rows = batch samples.
-
-    ``out`` must contain ``pred_masks`` (logits B×Nq×H×W) and ``pred_points`` (sigmoid B×Nq×(P*2)).
-
-    If ``matched_indices`` is set (same bipartite matching as training: one (src_idx, tgt_idx) per
-    image), the pred column only overlays **queries matched to a ground-truth instance**, in GT
-    index order (colors align with the GT column). If ``None``, all queries are drawn (legacy).
-    """
+) -> np.ndarray:
+    """Return a grid: columns = [RGB | GT masks+points | pred masks+points], as RGB uint8 (H, W, 3)."""
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    path = Path(path)
     bsz = images.shape[0]
     b = min(bsz, max_samples)
     if b <= 0:
-        return
+        return np.zeros((1, 1, 3), dtype=np.uint8)
 
     pred_masks = out["pred_masks"].float().cpu()
     pred_points = out["pred_points"].float().cpu()
@@ -324,9 +314,9 @@ def save_train_compare_grid(
 
     fig.suptitle("RDLNet: image | ground truth | prediction", fontsize=11, y=1.02)
     fig.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=125, bbox_inches="tight")
+    out_u8 = _fig_to_rgb_u8(fig)
     plt.close(fig)
+    return out_u8
 
 
 def main() -> None:

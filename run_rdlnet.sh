@@ -24,7 +24,7 @@ if [ -n "${RESUME:-}" ]; then
 fi
 
 exec python train_rdlnet.py \
-  --rwmd-root "output/data/rwmd/train_resize" \
+  --rwmd-root "output/data/train_resize" \
   --num-classes 2 \
   --distill-checkpoint checkpoints/distill_stage1.pt \
   --output output/rdlnet/rdlnet.pt \
