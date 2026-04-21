@@ -350,14 +350,12 @@ def main() -> None:
     p.add_argument(
         "--rwmd-root",
         type=Path,
-        default=Path("output/data/train_resize"),
-        help="Preprocessed RWMD root (e.g. path/to/train_resize)",
-    )
-    p.add_argument(
-        "--index",
-        type=int,
-        default=5,
-        help="Index into sorted img/*.png (default 0)",
+        default=Path("output/data"),
+        help=(
+            "RWMD dataset directory OR a preprocessed split directory. "
+            "If a dataset directory is passed, all '*_resize' splits under it are processed "
+            "(e.g. train_resize/, test_resize/)."
+        ),
     )
     p.add_argument(
         "--output",
@@ -398,12 +396,23 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    rwmd_root = args.rwmd_root
-    if rwmd_root is None:
-        raise SystemExit("Pass --rwmd-root to a preprocessed folder (train_resize with img/, mask/, label_points_resize.json)")
-    rwmd_root = rwmd_root.resolve()
+    rwmd_root = args.rwmd_root.resolve()
     if not rwmd_root.is_dir():
         raise SystemExit(f"Not a directory: {rwmd_root}")
+
+    def _is_preprocessed_split_dir(p: Path) -> bool:
+        return (p / "img").is_dir() and (p / "mask").is_dir() and (p / "label_points_resize.json").is_file()
+
+    # Accept either a preprocessed split directory (train_resize/) or a dataset directory containing splits.
+    if _is_preprocessed_split_dir(rwmd_root):
+        split_dirs = [rwmd_root]
+    else:
+        split_dirs = sorted([d for d in rwmd_root.glob("*_resize") if d.is_dir() and _is_preprocessed_split_dir(d)])
+        if not split_dirs:
+            raise SystemExit(
+                "No preprocessed '*_resize' splits found under --rwmd-root. "
+                "Expected e.g. train_resize/ with img/, mask/, label_points_resize.json."
+            )
 
     if args.num_classes is not None:
         num_classes = args.num_classes
@@ -418,19 +427,8 @@ def main() -> None:
     if args.img_size % cfg.patch_size != 0:
         raise SystemExit("img_size must be divisible by patch_size")
 
-    ds = RWMDLabelMeDataset(
-        rwmd_root,
-        img_size=cfg.img_size,
-        num_classes=cfg.num_classes,
-        num_points=cfg.num_points,
-        max_instances=cfg.num_queries,
-    )
     start = max(int(args.start), 0)
-    end = len(ds)
-    if args.limit and int(args.limit) > 0:
-        end = min(end, start + int(args.limit))
-    if start >= end and (args.output_dir is not None or args.tb_logdir is not None):
-        raise SystemExit(f"Empty range: start={start}, end={end}, len(ds)={len(ds)}")
+    limit = int(args.limit) if args.limit else 0
 
     if args.tb_logdir is not None:
         try:
@@ -444,19 +442,34 @@ def main() -> None:
         logdir.mkdir(parents=True, exist_ok=True)
 
         with SummaryWriter(log_dir=str(logdir)) as w:
-            for i in range(start, end):
-                sample = ds[i]
-                batch = collate_doc_batch([sample])
-                stem = Path(sample["path"]).stem
-                grid = annotations_viz_grid_u8(
-                    batch["images"],
-                    batch["tgt_masks"],
-                    batch["tgt_points"],
-                    max_samples=1,
-                    suptitle=f"RWMD GT — {rwmd_root.name} [{i}]",
+            global_step = 0
+            for split_root in split_dirs:
+                ds = RWMDLabelMeDataset(
+                    split_root,
+                    img_size=cfg.img_size,
+                    num_classes=cfg.num_classes,
+                    num_points=cfg.num_points,
+                    max_instances=cfg.num_queries,
                 )
-                chw = np.transpose(grid, (2, 0, 1))
-                w.add_image(f"rwmd_gt/{stem}", chw, global_step=i, dataformats="CHW")
+                end = len(ds)
+                if limit > 0:
+                    end = min(end, start + limit)
+                if start >= end:
+                    continue
+                for i in range(start, end):
+                    sample = ds[i]
+                    batch = collate_doc_batch([sample])
+                    stem = Path(sample["path"]).stem
+                    grid = annotations_viz_grid_u8(
+                        batch["images"],
+                        batch["tgt_masks"],
+                        batch["tgt_points"],
+                        max_samples=1,
+                        suptitle=f"RWMD GT — {split_root.name} [{i}]",
+                    )
+                    chw = np.transpose(grid, (2, 0, 1))
+                    w.add_image(f"rwmd_gt/{split_root.name}/{stem}", chw, global_step=global_step, dataformats="CHW")
+                    global_step += 1
         print(logdir)
         return
 
@@ -465,37 +478,59 @@ def main() -> None:
         if not out_dir.is_absolute():
             out_dir = (repo / out_dir).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
-        for i in range(start, end):
-            sample = ds[i]
-            batch = collate_doc_batch([sample])
-            stem = Path(sample["path"]).stem
-            out_path = out_dir / f"{stem}_gt.png"
-            save_annotations_viz_grid(
-                out_path,
-                batch["images"],
-                batch["tgt_masks"],
-                batch["tgt_points"],
-                max_samples=1,
-                suptitle=f"RWMD GT — {rwmd_root.name} [{i}]",
+        for split_root in split_dirs:
+            split_out = out_dir / split_root.name
+            split_out.mkdir(parents=True, exist_ok=True)
+            ds = RWMDLabelMeDataset(
+                split_root,
+                img_size=cfg.img_size,
+                num_classes=cfg.num_classes,
+                num_points=cfg.num_points,
+                max_instances=cfg.num_queries,
             )
+            end = len(ds)
+            if limit > 0:
+                end = min(end, start + limit)
+            if start >= end:
+                continue
+            for i in range(start, end):
+                sample = ds[i]
+                batch = collate_doc_batch([sample])
+                stem = Path(sample["path"]).stem
+                out_path = split_out / f"{stem}_gt.png"
+                save_annotations_viz_grid(
+                    out_path,
+                    batch["images"],
+                    batch["tgt_masks"],
+                    batch["tgt_points"],
+                    max_samples=1,
+                    suptitle=f"RWMD GT — {split_root.name} [{i}]",
+                )
         print(out_dir)
         return
-
-    index = int(args.index)
-    if index < 0 or index >= len(ds):
-        raise SystemExit(f"--index {index} out of range [0, {len(ds)})")
-    batch = collate_doc_batch([ds[index]])
 
     out_path = args.output
     if not out_path.is_absolute():
         out_path = (repo / out_path).resolve()
+    # Default: write the first sample of the first split (respecting --start).
+    first_split = split_dirs[0]
+    ds = RWMDLabelMeDataset(
+        first_split,
+        img_size=cfg.img_size,
+        num_classes=cfg.num_classes,
+        num_points=cfg.num_points,
+        max_instances=cfg.num_queries,
+    )
+    if start < 0 or start >= len(ds):
+        raise SystemExit(f"--start {start} out of range [0, {len(ds)}) for split {first_split}")
+    batch = collate_doc_batch([ds[start]])
     save_annotations_viz_grid(
         out_path,
         batch["images"],
         batch["tgt_masks"],
         batch["tgt_points"],
         max_samples=1,
-        suptitle=f"RWMD GT — {rwmd_root.name} [{index}]",
+        suptitle=f"RWMD GT — {first_split.name} [{start}]",
     )
     print(out_path)
 
