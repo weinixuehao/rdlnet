@@ -338,7 +338,12 @@ def main() -> None:
                         matched_indices=matched_indices,
                     )
                     chw = np.transpose(grid_u8, (2, 0, 1))
-                    tb.add_image("train/compare_grid", chw, global_step=global_step, dataformats="CHW")
+                    tb.add_image(
+                        f"train/compare_grid/epoch_{epoch + 1:04d}/step_{global_step:08d}",
+                        chw,
+                        global_step=global_step,
+                        dataformats="CHW",
+                    )
 
                 if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
                     torch.save(
