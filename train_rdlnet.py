@@ -302,6 +302,9 @@ def main() -> None:
     end_epoch = start_epoch + args.epochs
     for epoch in range(start_epoch, end_epoch):
         model.train()
+        # Group frequent visualizations by epoch for easier browsing.
+        epoch_dir = out_path.parent / f"epoch_{epoch + 1:04d}"
+        epoch_dir.mkdir(parents=True, exist_ok=True)
         epoch_loss = 0.0
         sum_cls = 0.0
         sum_dist = 0.0
@@ -354,7 +357,7 @@ def main() -> None:
                 and args.viz_every_steps > 0
                 and global_step % args.viz_every_steps == 0
             ):
-                viz_path = out_path.parent / f"{out_path.stem}_viz_s{global_step:08d}.png"
+                viz_path = epoch_dir / f"{out_path.stem}_viz_s{global_step:08d}.png"
                 with torch.no_grad():
                     _mi = criterion.matcher(
                         out["pred_logits"],
