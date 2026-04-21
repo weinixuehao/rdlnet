@@ -21,7 +21,7 @@ Example ``annotations.json`` (list of records)::
 - ``label``: int in ``[0, num_classes-1]`` (see RDLNetConfig.num_classes).
 - ``mask``: path to a binary or grayscale PNG (same coordinate frame as image); resized with nearest neighbor.
 - ``points``: length ``num_points * 2``, normalized coordinates ``x,y`` in ``[0, 1]`` in **original** image space;
-  unused pairs can be zeros (e.g. 4 corners + padding for 9 points).
+  unused pairs are padded with negative values (e.g. -1) and ignored by the point loss.
 
 RWMD offline data: :class:`RWMDLabelMeDataset` expects ``img/*.png``, ``mask/*.png`` (instance ids),
 and ``label_points_resize.json`` from ``data_preprocessing_rwdm_1.run_rwmd_preprocess``.
@@ -177,10 +177,10 @@ def _rwmd_quad_corners_xy(points_xy: Sequence[Sequence[float]]) -> np.ndarray:
 
 
 def _rwmd_flatten_points_norm(quad_xy: np.ndarray, w0: int, h0: int, num_points: int) -> Tensor:
-    """First 4 rows are normalized quad corners; remaining points are zero-padded."""
+    """First 4 rows are normalized quad corners; remaining points are padded with -1."""
     wh = np.array([float(w0), float(h0)], dtype=np.float32)
     q = (quad_xy / wh).astype(np.float32)
-    pts = np.zeros((num_points, 2), dtype=np.float32)
+    pts = np.full((num_points, 2), -1.0, dtype=np.float32)
     n = min(4, num_points)
     pts[:n] = q[:n]
     return torch.from_numpy(pts.reshape(-1))
@@ -288,9 +288,10 @@ class RWMDLabelMeDataset(Dataset):
 
             if inst_id == fore_idx and isinstance(fg_raw, list) and len(fg_raw) >= 3:
                 quad = _rwmd_quad_corners_xy(fg_raw)
+                pt = _rwmd_flatten_points_norm(quad, w0, h0, self.num_points)
             else:
-                quad = _rwmd_quad_from_instance_mask(bin_np)
-            pt = _rwmd_flatten_points_norm(quad, w0, h0, self.num_points)
+                # Background instances have masks/labels but no corner-point supervision.
+                pt = torch.full((self.point_dim,), -1.0, dtype=torch.float32)
             points.append(pt)
 
             lab = _rwmd_main_bg_class(inst_id, fore_idx, self.num_classes)

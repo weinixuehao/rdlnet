@@ -180,17 +180,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--img-size", type=int, default=1024)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument(
-        "--ignore-padded-points",
-        action="store_true",
-        help="Exclude padded (0,0) point pairs from point matching cost and point distance loss",
-    )
-    p.add_argument(
-        "--padded-point-eps",
-        type=float,
-        default=0.0,
-        help="Treat |x|<=eps and |y|<=eps as padded (default: 0.0)",
-    )
-    p.add_argument(
         "--loss-plot",
         type=str,
         default=None,
@@ -226,8 +215,6 @@ def main() -> None:
         img_size=args.img_size,
         num_classes=num_classes,
         use_sam_pixel_norm=True,
-        ignore_padded_points=args.ignore_padded_points,
-        padded_point_eps=args.padded_point_eps,
     )
     if args.img_size % cfg.patch_size != 0:
         raise ValueError("img_size must be divisible by patch_size")
@@ -372,6 +359,7 @@ def main() -> None:
                     viz_path,
                     images.detach().cpu(),
                     {k: v.detach().cpu() for k, v in out.items()},
+                    [t.detach().cpu() for t in tgt_labels],
                     [t.detach().cpu() for t in tgt_masks],
                     [t.detach().cpu() for t in tgt_points],
                     max_samples=args.viz_samples,

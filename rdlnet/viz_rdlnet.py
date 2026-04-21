@@ -77,6 +77,10 @@ def _blend_instances(
 def _draw_quad_corners(ax, pts_flat: np.ndarray, h: int, w: int, color, n_corners: int = 4) -> None:
     n = pts_flat.size // 2
     pts = pts_flat.reshape(n, 2)[:n_corners]
+    # Skip padded / invalid points (negative coords are used as padding).
+    pts = pts[(pts[:, 0] >= 0.0) & (pts[:, 1] >= 0.0)]
+    if pts.size == 0:
+        return
     xs = pts[:, 0] * float(max(w - 1, 1))
     ys = pts[:, 1] * float(max(h - 1, 1))
     ax.scatter(xs, ys, c=color, s=14, linewidths=0.4, edgecolors="white", zorder=5)
@@ -222,6 +226,7 @@ def save_train_compare_grid(
     path: Path | str,
     images: Tensor,
     out: Dict[str, Tensor],
+    tgt_labels: List[Tensor],
     tgt_masks: List[Tensor],
     tgt_points: List[Tensor],
     *,
@@ -296,9 +301,12 @@ def save_train_compare_grid(
         axes[i, 1].imshow(gt_vis)
         axes[i, 1].set_title(f"GT ({len(gt_layers)} inst.)")
         axes[i, 1].axis("off")
+        tl = tgt_labels[i].long().cpu()
+        fg = (tl == 0).nonzero(as_tuple=False).view(-1)
         tpts = tgt_points[i].float().cpu().numpy()
-        for j in range(tpts.shape[0]):
-            _draw_quad_corners(axes[i, 1], tpts[j], h, w, f"C{j % 10}", n_corner_vis)
+        for j in fg.tolist():
+            if 0 <= j < tpts.shape[0]:
+                _draw_quad_corners(axes[i, 1], tpts[j], h, w, f"C{j % 10}", n_corner_vis)
 
         axes[i, 2].imshow(pred_vis)
         axes[i, 2].set_title(pred_title)
@@ -306,8 +314,10 @@ def save_train_compare_grid(
         if use_match:
             if tgt_i.numel() > 0:
                 pairs = sorted(zip(src_i.tolist(), tgt_i.tolist()), key=lambda p: p[1])
+                fg_set = set(fg.tolist())
                 for s, tj in pairs:
-                    _draw_quad_corners(axes[i, 2], ppts[int(s)], h, w, f"C{tj % 10}", n_corner_vis)
+                    if tj in fg_set:
+                        _draw_quad_corners(axes[i, 2], ppts[int(s)], h, w, f"C{tj % 10}", n_corner_vis)
         else:
             for q in range(nq):
                 _draw_quad_corners(axes[i, 2], ppts[q], h, w, f"C{q % 10}", n_corner_vis)
@@ -386,11 +396,6 @@ def main() -> None:
         default=None,
         help="Override class count (default: 2 for RWMD main/background)",
     )
-    p.add_argument(
-        "--ignore-padded-points",
-        action="store_true",
-    )
-    p.add_argument("--padded-point-eps", type=float, default=0.0)
     args = p.parse_args()
 
     rwmd_root = args.rwmd_root
@@ -409,8 +414,6 @@ def main() -> None:
         img_size=args.img_size,
         num_classes=num_classes,
         use_sam_pixel_norm=True,
-        ignore_padded_points=args.ignore_padded_points,
-        padded_point_eps=args.padded_point_eps,
     )
     if args.img_size % cfg.patch_size != 0:
         raise SystemExit("img_size must be divisible by patch_size")

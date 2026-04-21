@@ -22,15 +22,15 @@ def dice_loss(pred: Tensor, target: Tensor, eps: float = 1e-6) -> Tensor:
     return (1 - num / den).mean()
 
 
-def _points_valid_mask_from_padding(tp: Tensor, eps: float = 0.0) -> Tensor:
+def _points_valid_mask_from_padding(tp: Tensor) -> Tensor:
     """
     Build a [Nt, P*2] float mask where padded point pairs are excluded.
 
-    Convention: a point pair (x,y) is considered padding if both |x|<=eps and |y|<=eps.
+    Convention: a point pair (x,y) is considered padding / invalid if either coordinate is negative.
     """
     # tp: [Nt, P*2]
     pts = tp.view(tp.shape[0], -1, 2)
-    valid_pt = (pts.abs() > eps).any(dim=-1).float()  # [Nt, P]
+    valid_pt = ((pts[..., 0] >= 0.0) & (pts[..., 1] >= 0.0)).float()  # [Nt, P]
     return valid_pt.unsqueeze(-1).repeat(1, 1, 2).view(tp.shape[0], -1)  # [Nt, P*2]
 
 
@@ -100,11 +100,8 @@ class HungarianMatcher(nn.Module):
             cost_m = torch.cdist(pm.flatten(1), tm.flatten(1), p=1) / (tm.shape[-1] * tm.shape[-2])
 
             # point L1 cost [Nq, Nt]
-            if self.cfg.ignore_padded_points:
-                m = _points_valid_mask_from_padding(tp, eps=float(self.cfg.padded_point_eps))
-                cost_p = _masked_l1_cost(pred_points[i], tp, m)
-            else:
-                cost_p = torch.cdist(pred_points[i], tp, p=1)
+            m = _points_valid_mask_from_padding(tp)
+            cost_p = _masked_l1_cost(pred_points[i], tp, m)
 
             C = self.cost_class * cost_c + self.cost_mask * cost_m + self.cost_point * cost_p
             src, dst = linear_sum_assignment(C)
@@ -178,13 +175,10 @@ class RDLNetLoss(nn.Module):
 
             pp = pred_points[i][src_i]
             tp = tgt_points[i][tgt_i]
-            if self.cfg.ignore_padded_points:
-                m = _points_valid_mask_from_padding(tp, eps=float(self.cfg.padded_point_eps))
-                diff = (pp - tp).abs() * m
-                den = m.sum(dim=-1).clamp_min(1.0)
-                loss_dist = loss_dist + (diff.sum(dim=-1) / den).mean()
-            else:
-                loss_dist = loss_dist + (pp - tp).abs().mean()
+            m = _points_valid_mask_from_padding(tp)
+            diff = (pp - tp).abs() * m
+            den = m.sum(dim=-1).clamp_min(1.0)
+            loss_dist = loss_dist + (diff.sum(dim=-1) / den).mean()
 
         n_inst = max(n_inst, 1)
         loss_cls = loss_cls / b

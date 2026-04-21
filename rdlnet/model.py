@@ -39,11 +39,6 @@ class RDLNetConfig:
     ffn_dim: int = 2048
     dropout: float = 0.1
     encoder_n_points: int = 4
-    # If True, treat (0,0) pairs in target points as padding and exclude them from
-    # point matching cost and point distance loss. Useful when only a subset of
-    # polygon/corner points are annotated.
-    ignore_padded_points: bool = False
-    padded_point_eps: float = 0.0
 
 
 def _init_deformable_attn(m: nn.Module) -> None:
