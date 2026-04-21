@@ -87,39 +87,6 @@ def load_loss_history_from_ck(ck: dict) -> tuple[list[int], list[float], list[fl
     return ep[:n], lo[:n], lc[:n], ld[:n], ldi[:n], lm[:n]
 
 
-def save_loss_plot_png(
-    path: Path,
-    epochs: list[int],
-    loss: list[float],
-    loss_cls: list[float],
-    loss_dist: list[float],
-    loss_dice: list[float],
-    loss_mask: list[float],
-) -> None:
-    """Overwrite PNG with per-epoch mean training losses."""
-    if not epochs:
-        return
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(epochs, loss, label="total")
-    ax.plot(epochs, loss_cls, label="loss_cls")
-    ax.plot(epochs, loss_dist, label="loss_dist")
-    ax.plot(epochs, loss_dice, label="loss_dice")
-    ax.plot(epochs, loss_mask, label="loss_mask")
-    ax.set_xlabel("epoch")
-    ax.set_ylabel("mean (train batch)")
-    ax.legend(loc="upper right", fontsize=8)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Stage 2: train RDLNet on annotated documents")
     p.add_argument("--annotations", type=str, default=None, help="JSON list (see rdlnet.data.doc_json)")
@@ -180,10 +147,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--img-size", type=int, default=1024)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument(
-        "--loss-plot",
-        type=str,
-        default=None,
-        help="PNG path for loss curves (default: next to --output, e.g. rdlnet_loss.png)",
+        "--max-batches-per-epoch",
+        type=int,
+        default=0,
+        help="If >0, stop each epoch after this many train batches (debug/smoke runs)",
     )
     p.add_argument(
         "--viz-samples",
@@ -288,8 +255,6 @@ def main() -> None:
     os.makedirs(Path(args.output).parent or ".", exist_ok=True)
     out_path = Path(args.output)
     step_ckpt = out_path.with_name(out_path.stem + "_latest.pt")
-    loss_plot_path = Path(args.loss_plot) if args.loss_plot else out_path.with_name(out_path.stem + "_loss.png")
-    print(f"loss plot (PNG) => {loss_plot_path}")
 
     tb_logdir = out_path.parent / f"{out_path.stem}_tb"
     tb_logdir.mkdir(parents=True, exist_ok=True)
@@ -307,7 +272,8 @@ def main() -> None:
             sum_dice = 0.0
             sum_mask = 0.0
             n_batches = 0
-            for batch in tqdm(loader, desc=f"epoch {epoch + 1}/{end_epoch}", leave=True):
+            max_batches = int(args.max_batches_per_epoch)
+            for bi, batch in enumerate(tqdm(loader, desc=f"epoch {epoch + 1}/{end_epoch}", leave=True)):
                 images = batch["images"].to(device)
                 tgt_labels = [t.to(device) for t in batch["tgt_labels"]]
                 tgt_masks = [t.to(device) for t in batch["tgt_masks"]]
@@ -387,47 +353,46 @@ def main() -> None:
                         step_ckpt,
                     )
                     tqdm.write(f"Saved step checkpoint -> {step_ckpt}")
+                if max_batches > 0 and (bi + 1) >= max_batches:
+                    break
 
-        nb = max(n_batches, 1)
-        avg = epoch_loss / nb
-        avg_cls = sum_cls / nb
-        avg_dist = sum_dist / nb
-        avg_dice = sum_dice / nb
-        avg_mask = sum_mask / nb
-        ep_no = epoch + 1
-        hist_ep.append(ep_no)
-        hist_loss.append(avg)
-        hist_cls.append(avg_cls)
-        hist_dist.append(avg_dist)
-        hist_dice.append(avg_dice)
-        hist_mask.append(avg_mask)
-        print(
-            f"epoch {ep_no} mean loss={avg:.4f} "
-            f"cls={avg_cls:.4f} dist={avg_dist:.4f} dice={avg_dice:.4f} mask={avg_mask:.4f}"
-        )
+            nb = max(n_batches, 1)
+            avg = epoch_loss / nb
+            avg_cls = sum_cls / nb
+            avg_dist = sum_dist / nb
+            avg_dice = sum_dice / nb
+            avg_mask = sum_mask / nb
+            ep_no = epoch + 1
+            hist_ep.append(ep_no)
+            hist_loss.append(avg)
+            hist_cls.append(avg_cls)
+            hist_dist.append(avg_dist)
+            hist_dice.append(avg_dice)
+            hist_mask.append(avg_mask)
+            tb.add_scalars(
+                "train_epoch/losses",
+                {
+                    "total": avg,
+                    "cls": avg_cls,
+                    "dist": avg_dist,
+                    "dice": avg_dice,
+                    "mask": avg_mask,
+                },
+                global_step=ep_no,
+            )
 
-        ckpt: dict[str, Any] = {
-            "model": model.state_dict(),
-            "optimizer": opt.state_dict(),
-            "config": asdict(cfg),
-            "epoch": ep_no,
-            "global_step": global_step,
-            LOSS_HISTORY_KEY: pack_loss_history(
-                hist_ep, hist_loss, hist_cls, hist_dist, hist_dice, hist_mask
-            ),
-        }
-        torch.save(ckpt, args.output)
-        print(f"Saved {args.output}")
-        save_loss_plot_png(
-            loss_plot_path,
-            hist_ep,
-            hist_loss,
-            hist_cls,
-            hist_dist,
-            hist_dice,
-            hist_mask,
-        )
-        print(f"Updated loss plot -> {loss_plot_path}")
+            ckpt: dict[str, Any] = {
+                "model": model.state_dict(),
+                "optimizer": opt.state_dict(),
+                "config": asdict(cfg),
+                "epoch": ep_no,
+                "global_step": global_step,
+                LOSS_HISTORY_KEY: pack_loss_history(
+                    hist_ep, hist_loss, hist_cls, hist_dist, hist_dice, hist_mask
+                ),
+            }
+            torch.save(ckpt, args.output)
+            print(f"Saved {args.output}")
 
 
 if __name__ == "__main__":
