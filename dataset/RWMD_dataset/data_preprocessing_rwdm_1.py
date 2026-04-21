@@ -1,24 +1,55 @@
-'''
-Descripttion: This code is used for the pre-processing of the RWMD dataset
-version: 1.0
-Author: duany
-Date: 2024-07-29 03:47:03
-LastEditors: xuzhen
-LastEditTime: 2024-07-29 22:29:50
-'''
-import os
-from typing import Optional
+"""
+RWMD dataset preprocessing (LabelMe → training packs).
 
-import cv2
-from tqdm import tqdm
-import shutil
-import random
-import numpy as np
+**Main entry:** :func:`run_rwmd_preprocess` — recursive scan of ``--src``, flat export under
+``_work_flat``, train/test split, longest-edge resize → ``<out>/train_resize`` and
+``<out>/test_resize`` (each with ``img/``, ``mask/``, ``label_points_resize.json``).
+
+**Core steps**
+
+1. :func:`genarate_label_from_ori` — per image + sidecar ``.json``: numeric polygon labels use
+   **max digit = foreground**, smaller digits = background (union → contour instances); optional
+   ``foreground_doc`` quadrilateral → ``label_points.json`` keys.
+2. :func:`split_data` — shuffle split ``img``/``mask``/``label_points.json``.
+3. :func:`resize_customdata` — scale image, mask, and quad points; write ``label_points_resize.json``.
+
+Other functions in this file are legacy/experiment helpers (resize subsets, stats, etc.).
+"""
+
+from __future__ import annotations
+
 import glob
 import json
-from base64 import b64encode, b64decode
+import os
+import random
+import shutil
+from base64 import b64decode
 from io import BytesIO
+from typing import Dict, Optional
+
+import cv2
+import numpy as np
 from PIL import Image
+from tqdm import tqdm
+
+
+def _strip_closing_vertex_xy(pts_xy: np.ndarray) -> np.ndarray:
+    """If polygon is closed (first==last), drop the last vertex."""
+    if pts_xy.shape[0] >= 2 and np.allclose(pts_xy[0], pts_xy[-1], rtol=0.0, atol=1e-3):
+        return pts_xy[:-1]
+    return pts_xy
+
+
+def _order_quad_tl_tr_br_bl(pts4_xy: np.ndarray) -> np.ndarray:
+    """Return 4 points ordered as TL, TR, BR, BL for perspective transform."""
+    p = np.asarray(pts4_xy, dtype=np.float32).reshape(4, 2)
+    s = p[:, 0] + p[:, 1]
+    d = p[:, 0] - p[:, 1]
+    tl = p[int(np.argmin(s))]
+    br = p[int(np.argmax(s))]
+    tr = p[int(np.argmin(d))]
+    bl = p[int(np.argmax(d))]
+    return np.stack([tl, tr, br, bl], axis=0)
 
 def _quantize_instance_mask_for_png(mask_u8: np.ndarray) -> np.ndarray:
     """
@@ -30,12 +61,26 @@ def _quantize_instance_mask_for_png(mask_u8: np.ndarray) -> np.ndarray:
     mid = int(mask_u8.max())
     if mid <= 0:
         return mask_u8
+    kk = np.arange(1, mid + 1, dtype=np.float64)
+    vals = np.round(255.0 * kk / float(mid)).astype(np.int32)
+    vals = np.clip(vals, 1, 255).astype(np.uint8)
     out = np.zeros_like(mask_u8)
-    for k in range(1, mid + 1):
-        v = int(round(255.0 * float(k) / float(mid)))
-        v = max(1, min(255, v))
-        out[mask_u8 == k] = np.uint8(v)
+    idx = mask_u8.astype(np.intp)
+    valid = idx > 0
+    out[valid] = vals[idx[valid] - 1]
     return out
+
+
+# Image extensions we expect next to a LabelMe JSON (lowercase basename suffix).
+_IMG_EXT = frozenset({".jpg", ".jpeg", ".png"})
+
+
+def _sidecar_json_path(img_p: str) -> Optional[str]:
+    """``image.jpg`` → ``image.json``; returns ``None`` if ``img_p`` is not a supported raster name."""
+    _, ext = os.path.splitext(img_p)
+    if ext.lower() not in _IMG_EXT:
+        return None
+    return os.path.splitext(img_p)[0] + ".json"
 
 
 def _out_png_from_src_rel(src_root: str, img_p: str) -> str:
@@ -260,21 +305,20 @@ def genarate_label_from_ori(src_dir, dst_dir):
     ``img/*.png``, ``mask/*.png``, and ``label_points.json`` keys matching those basenames.
     Output names encode relative paths (``subdir__file.png``) so nested files do not overwrite.
 
+    **Digit polygon labels:** only **foreground vs background** (binary). Let ``M`` be the
+    **maximum** digit among numeric shapes (ignoring ``foreground_doc``). Polygons with label
+    ``M`` are **foreground document**; every polygon with a smaller digit is **background**
+    (unioned, then split into instances by contours). If only ``"1"`` appears, ``M == 1`` and
+    those polygons are **foreground**; there is no separate background digit layer.
+
     Instance ids ``1..K`` in ``mask`` are scaled to spread grayscale ``1..255`` (``K==1`` → 255)
     so PNGs are visible; order is preserved for downstream loaders that use ``max(unique)``.
     """
-    label_mapper = {"1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9, "10": 10,
-                     "11": 11, "12": 12, "13": 13, "14": 14, "15": 15, "16": 16, "17": 17, "18": 18}
-
     src_root = os.path.abspath(os.path.normpath(src_dir))
 
     points_json = {}
-    if not os.path.exists(dst_dir):
-        os.mkdir(dst_dir)
-    if not os.path.exists(dst_dir + "/img"):
-        os.mkdir(dst_dir+"/img")
-    if not os.path.exists(dst_dir + "/mask"):
-        os.mkdir(dst_dir+"/mask")
+    os.makedirs(os.path.join(dst_dir, "img"), exist_ok=True)
+    os.makedirs(os.path.join(dst_dir, "mask"), exist_ok=True)
 
 
     # for img_p in tqdm(imgs_path):
@@ -287,73 +331,76 @@ def genarate_label_from_ori(src_dir, dst_dir):
             if file.endswith(".json"):
                 continue
             img_p = os.path.join(root, file)
-            img = cv2.imread(img_p)
-            if img is None:
-                continue
             img_n = os.path.basename(img_p)
-            if "jpg" in img_n:
-                label_p = img_p.replace(".jpg", ".json")
-            elif "png" in img_n:
-                label_p = img_p.replace(".png", ".json")
-            elif "jpeg" in img_n:
-                label_p = img_p.replace(".jpeg", ".json")
-            elif "JPG" in img_n:
-                label_p = img_p.replace(".JPG", ".json")
-            elif "PNG" in img_n:
-                label_p = img_p.replace(".PNG", ".json")
-            elif "JPEG" in img_n:
-                label_p = img_p.replace(".JPEG", ".json")
+            label_p = _sidecar_json_path(img_p)
+            if label_p is None or not os.path.isfile(label_p):
+                continue
             with open(label_p, "r", encoding="utf-8") as _lf:
                 label = json.load(_lf)
 
-            label_infos = []
-            foreground_quad: Optional[np.ndarray] = None
-            for l in label['shapes']:
-                label_symbol = l['label']      # str
-                if label_symbol not in label_mapper:
-                    if label_symbol == "foreground_doc":
-                        foreground_quad = np.asarray(l['points']).astype(np.int32)
-                    continue
-                label_idx = label_mapper[label_symbol]
-                points = np.asarray(l['points']).astype(np.int32)           # (N, 2)
-                label_infos.append((label_idx, points))
-
-            if not label_infos:
+            # No EXIF/point remapping: use the raw pixel frame for both masks and points.
+            img_bgr = cv2.imread(img_p, cv2.IMREAD_COLOR)
+            if img_bgr is None:
                 continue
 
-            mask = np.zeros(img.shape[:2], dtype=np.uint8)
-            label_infos_sorted = sorted(label_infos, key=lambda x: x[0])
-            # 找到前景id, find the foreground document id
-            fore_idx = label_infos_sorted[-1][0]
-            # 用1临时填充背景mask, temporarily fill the background mask with 1
-            for label_idx, points in label_infos_sorted[:-1]:
-                cv2.fillPoly(mask, [points], 1)
-            # 重新给背景文档赋值, reassign the background document
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            too_small_contours = 0
-            new_label_infos = []
-            new_label_idx = 0
-            for i in range(len(contours)):
-                hull = cv2.convexHull(contours[i])
-                area_cur = cv2.contourArea(hull)
-                if area_cur < 100:
-                    too_small_contours += 1
+            bg_polys: list[np.ndarray] = []
+            fg_polys: list[np.ndarray] = []
+            foreground_quad: Optional[np.ndarray] = None
+            digit_polys: list[tuple[int, np.ndarray]] = []
+            for l in label["shapes"]:
+                lab = l.get("label")
+                if lab == "foreground_doc":
+                    pts = np.asarray(l.get("points") or [], dtype=np.float32)
+                    pts = _strip_closing_vertex_xy(pts)
+                    if pts.shape[0] == 4:
+                        foreground_quad = _order_quad_tl_tr_br_bl(pts).astype(np.int32)
                     continue
-                new_label_idx = i + 1
-                new_label_infos.append((new_label_idx, contours[i]))
-            # 重新给前景文档赋值, reassign the foreground document
-            fore_idx = new_label_idx + 1
-            new_label_infos.append((fore_idx, label_infos_sorted[-1][1]))
+                if not (isinstance(lab, str) and lab.isdigit()):
+                    continue
+                digit_polys.append((int(lab), np.asarray(l.get("points") or [], dtype=np.int32)))
 
-            mask_new = np.zeros(img.shape[:2], dtype=np.uint8)
-            new_label_infos_sorted = sorted(new_label_infos, key=lambda x: x[0])
-            for label_idx, points in new_label_infos_sorted:
-                points = np.asarray(points).astype(np.int32)
-                cv2.fillPoly(mask_new, [points], label_idx)
+            if digit_polys:
+                max_lab = max(d[0] for d in digit_polys)
+                for lab_i, poly in digit_polys:
+                    if lab_i == max_lab:
+                        fg_polys.append(poly)
+                    else:
+                        bg_polys.append(poly)
+
+            if not fg_polys and not bg_polys:
+                continue
+
+            h, w = int(img_bgr.shape[0]), int(img_bgr.shape[1])
+            # Background: union all bg polys into one mask, then split into connected components (docs).
+            bg_union = np.zeros((h, w), dtype=np.uint8)
+            for poly in bg_polys:
+                if poly.size == 0:
+                    continue
+                cv2.fillPoly(bg_union, [np.asarray(poly, dtype=np.int32)], 1)
+
+            contours, _ = cv2.findContours(bg_union, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            bg_instances: list[np.ndarray] = []
+            for c in contours:
+                hull = cv2.convexHull(c)
+                if cv2.contourArea(hull) < 100:
+                    continue
+                bg_instances.append(c)
+
+            mask_new = np.zeros((h, w), dtype=np.uint8)
+            inst_id = 0
+            for c in sorted(bg_instances, key=lambda cc: cv2.contourArea(cc), reverse=True):
+                inst_id += 1
+                cv2.fillPoly(mask_new, [np.asarray(c, dtype=np.int32)], inst_id)
+
+            # Foreground: always the last / max instance id.
+            if fg_polys:
+                inst_id += 1
+                for poly in fg_polys:
+                    if poly.size == 0:
+                        continue
+                    cv2.fillPoly(mask_new, [np.asarray(poly, dtype=np.int32)], inst_id)
 
             out_png = _out_png_from_src_rel(src_root, img_p)
-            if too_small_contours > 0:
-                print(out_png, too_small_contours)
             if foreground_quad is not None and foreground_quad.size > 0:
                 points_json[out_png] = foreground_quad.tolist()
             else:
@@ -361,7 +408,7 @@ def genarate_label_from_ori(src_dir, dst_dir):
 
             mask_png = _quantize_instance_mask_for_png(mask_new)
 
-            shutil.copy(img_p, os.path.join(dst_dir, "img", out_png))
+            cv2.imwrite(os.path.join(dst_dir, "img", out_png), img_bgr)
             cv2.imwrite(os.path.join(dst_dir, "mask", out_png), mask_png)
     with open(f"{dst_dir}/label_points.json", "w", encoding="utf-8") as f:
         json.dump(points_json, f, indent=4, ensure_ascii=False)
@@ -435,15 +482,14 @@ def split_data(root_dir: str, train_ratio: float = 0.75, seed: int = 42) -> None
     with open(os.path.join(test_root, "label_points.json"), "w", encoding="utf-8") as f:
         json.dump(test_pts, f, indent=4, ensure_ascii=False)
 
-def _lookup_label_points(json_label: dict, img_n: str):
-    """Resolve ``img_n`` key; allow stem match if legacy keys differ."""
-    if img_n in json_label:
-        return img_n
-    stem = os.path.splitext(img_n)[0]
+def _label_points_stem_index(json_label: dict) -> Dict[str, str]:
+    """First key per basename stem (insertion order) for O(1) stem lookups."""
+    by_stem: Dict[str, str] = {}
     for k in json_label:
-        if os.path.splitext(k)[0] == stem:
-            return k
-    return None
+        stem = os.path.splitext(k)[0]
+        if stem not in by_stem:
+            by_stem[stem] = k
+    return by_stem
 
 
 def resize_customdata(
@@ -462,6 +508,7 @@ def resize_customdata(
     imgs_paths = sorted(glob.glob(os.path.join(src_dir, "img", "*.png")))
     with open(json_path, "r", encoding="utf-8") as f:
         json_label = json.load(f)
+    stem_index = _label_points_stem_index(json_label)
 
     for img_p in tqdm(imgs_paths):
         img = cv2.imread(img_p)
@@ -491,11 +538,23 @@ def resize_customdata(
         cv2.imwrite(os.path.join(dst_dir, "img", img_n), img)
         cv2.imwrite(os.path.join(dst_dir, "mask", img_n), mask)
 
-        key = _lookup_label_points(json_label, img_n)
-        if key is None or not json_label[key]:
+        # `label_points.json` keys are expected to be image basenames (often `*.png`).
+        # The previous code mistakenly used `json_label.get(img_n)` as a *key*, which becomes a
+        # list-of-points and crashes with "unhashable type: 'list'" once non-empty points appear.
+        key_name = img_n if img_n in json_label else stem_index.get(os.path.splitext(img_n)[0])
+        pts = json_label.get(key_name) if key_name else None
+
+        if not pts:
             json_save[img_n] = []
             continue
-        point_scale = np.asarray(json_label[key], dtype=np.float64) * scale
+
+        # Defensive: points should be list[[x,y], ...] (often length 4 for `foreground_doc` quad).
+        if not isinstance(pts, list) or (len(pts) > 0 and (not isinstance(pts[0], (list, tuple)) or len(pts[0]) != 2)):
+            print(f"[WARN] bad label_points for {img_n}: type={type(pts).__name__} sample={str(pts)[:120]}")
+            json_save[img_n] = []
+            continue
+
+        point_scale = np.asarray(pts, dtype=np.float64) * scale
         json_save[img_n] = point_scale.tolist()
 
     out_json = os.path.join(dst_dir, "label_points_resize.json")

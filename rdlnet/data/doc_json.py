@@ -43,16 +43,12 @@ from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from .rwmd_exif_points import load_rgb_exif_aligned
 
-
-def _load_pil_rgb_exif(path: Union[str, Path]) -> Image.Image:
-    """
-    Decode image and apply EXIF Orientation so width/height match viewers and LabelMe
-    (JPEGs are often stored landscape with Orientation=rotate; raw ``Image.open`` is wrong).
-    """
-    _, im = load_rgb_exif_aligned(path)
-    return im
+def _load_pil_rgb(path: Union[str, Path]) -> Image.Image:
+    """Decode image as stored on disk (pixels already upright; no EXIF orientation)."""
+    im = Image.open(path)
+    im.load()
+    return im.convert("RGB")
 
 
 def collate_doc_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -100,7 +96,7 @@ class DocLocalizationJsonDataset(Dataset):
         if not path.is_file():
             raise FileNotFoundError(path)
 
-        im = _load_pil_rgb_exif(path)
+        im = _load_pil_rgb(path)
         w0, h0 = im.size
         im = im.resize((self.img_size, self.img_size), Image.BICUBIC)
         image = torch.from_numpy(np.asarray(im).copy()).float().permute(2, 0, 1)
@@ -215,7 +211,9 @@ class RWMDLabelMeDataset(Dataset):
     - ``mask/*.png`` — uint8 instance ids (largest id = top sheet).
     - ``label_points_resize.json`` — ``foreground_doc`` polygon per basename for quad targets.
 
-    **Classes:** top sheet (max instance id) → 0; others → 1 (use ``num_classes=2``).
+    LabelMe digits are fg/bg only: **max digit** = foreground document, smaller digits = background
+    (see ``genarate_label_from_ori``). **Classes:** top sheet (max instance id in mask) → 0;
+    others → 1 (use ``num_classes=2``).
     """
 
     def __init__(

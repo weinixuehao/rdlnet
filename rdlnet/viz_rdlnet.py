@@ -151,6 +151,73 @@ def save_annotations_viz_grid(
     plt.close(fig)
 
 
+def _fig_to_rgb_u8(fig) -> np.ndarray:
+    """Render a matplotlib figure to RGB uint8 (H, W, 3)."""
+    fig.canvas.draw()
+    w, h = fig.canvas.get_width_height()
+    # Matplotlib 3.8+ prefers buffer_rgba(); older versions may not have it.
+    if hasattr(fig.canvas, "buffer_rgba"):
+        rgba = np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)
+        return rgba[..., :3]
+    # Fallback: tostring_argb -> convert to rgb
+    if hasattr(fig.canvas, "tostring_argb"):
+        argb = np.frombuffer(fig.canvas.tostring_argb(), dtype=np.uint8).reshape(h, w, 4)
+        return argb[..., 1:4]
+    raise AttributeError("matplotlib canvas has no RGB buffer method (expected buffer_rgba or tostring_argb)")
+
+
+def annotations_viz_grid_u8(
+    images: Tensor,
+    tgt_masks: List[Tensor],
+    tgt_points: List[Tensor],
+    *,
+    max_samples: int = 8,
+    mask_thresh: float = 0.5,
+    n_corner_vis: int = 4,
+    suptitle: str = "Annotations (GT only)",
+) -> np.ndarray:
+    """Return the same GT grid as :func:`save_annotations_viz_grid`, as RGB uint8."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    bsz = images.shape[0]
+    b = min(bsz, max_samples)
+    if b <= 0:
+        return np.zeros((1, 1, 3), dtype=np.uint8)
+
+    ncols = 2
+    fig, axes = plt.subplots(b, ncols, figsize=(4.2 * ncols, 3.5 * b), squeeze=False)
+
+    for i in range(b):
+        rgb = _chw_to_uint8_hwc(images[i])
+        h, w = int(rgb.shape[0]), int(rgb.shape[1])
+
+        tm = tgt_masks[i].float().cpu().numpy()
+        gt_layers = (
+            [_resize_mask_to_hw(tm[j], h, w) for j in range(tm.shape[0])] if tm.size > 0 else []
+        )
+        gt_vis = _blend_instances(rgb.copy(), gt_layers, mask_thresh=mask_thresh)
+
+        axes[i, 0].imshow(rgb)
+        axes[i, 0].set_title("image")
+        axes[i, 0].axis("off")
+
+        axes[i, 1].imshow(gt_vis)
+        axes[i, 1].set_title(f"GT ({len(gt_layers)} inst.)")
+        axes[i, 1].axis("off")
+        tpts = tgt_points[i].float().cpu().numpy()
+        for j in range(tpts.shape[0]):
+            _draw_quad_corners(axes[i, 1], tpts[j], h, w, f"C{j % 10}", n_corner_vis)
+
+    fig.suptitle(suptitle, fontsize=11, y=1.02)
+    fig.tight_layout()
+    out = _fig_to_rgb_u8(fig)
+    plt.close(fig)
+    return out
+
+
 def save_train_compare_grid(
     path: Path | str,
     images: Tensor,
@@ -253,20 +320,20 @@ def save_train_compare_grid(
 
 
 def main() -> None:
-    """Load one sample from a preprocessed RWMD folder and write a GT-only PNG via :func:`save_annotations_viz_grid`."""
+    """Visualize preprocessed RWMD samples (GT only, no model)."""
     import argparse
     import sys
-
-    from rdlnet.data import RWMDLabelMeDataset, collate_doc_batch
-    from rdlnet.model import RDLNetConfig
 
     repo = Path(__file__).resolve().parents[1]
     if str(repo) not in sys.path:
         sys.path.insert(0, str(repo))
 
+    from rdlnet.data import RWMDLabelMeDataset, collate_doc_batch
+    from rdlnet.model import RDLNetConfig
+
     p = argparse.ArgumentParser(
         description=(
-            "Visualize one preprocessed RWMD sample (GT only, no model). "
+            "Visualize preprocessed RWMD samples (GT only, no model). "
             "Requires img/, mask/, label_points_resize.json (see data_preprocessing_rwdm_1.py)."
         ),
     )
@@ -287,6 +354,30 @@ def main() -> None:
         type=Path,
         default=Path("output/rwmd_gt_sample.png"),
         help="Output PNG path",
+    )
+    p.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="If set, write one PNG per sample into this directory (overrides --output)",
+    )
+    p.add_argument(
+        "--tb-logdir",
+        type=Path,
+        default=None,
+        help="If set, log one GT grid image per sample to TensorBoard in this logdir (overrides --output/--output-dir)",
+    )
+    p.add_argument(
+        "--start",
+        type=int,
+        default=0,
+        help="Start index (for --output-dir/--tb-logdir)",
+    )
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Max number of samples (0 = all; for --output-dir/--tb-logdir)",
     )
     p.add_argument("--img-size", type=int, default=1024)
     p.add_argument(
@@ -331,9 +422,66 @@ def main() -> None:
         num_points=cfg.num_points,
         max_instances=cfg.num_queries,
     )
-    if args.index < 0 or args.index >= len(ds):
-        raise SystemExit(f"--index {args.index} out of range [0, {len(ds)})")
-    batch = collate_doc_batch([ds[args.index]])
+    start = max(int(args.start), 0)
+    end = len(ds)
+    if args.limit and int(args.limit) > 0:
+        end = min(end, start + int(args.limit))
+    if start >= end and (args.output_dir is not None or args.tb_logdir is not None):
+        raise SystemExit(f"Empty range: start={start}, end={end}, len(ds)={len(ds)}")
+
+    if args.tb_logdir is not None:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except Exception as e:  # pragma: no cover
+            raise SystemExit(f"TensorBoard not available (install tensorboard). Import error: {e}") from e
+
+        logdir = args.tb_logdir
+        if not logdir.is_absolute():
+            logdir = (repo / logdir).resolve()
+        logdir.mkdir(parents=True, exist_ok=True)
+
+        with SummaryWriter(log_dir=str(logdir)) as w:
+            for i in range(start, end):
+                sample = ds[i]
+                batch = collate_doc_batch([sample])
+                stem = Path(sample["path"]).stem
+                grid = annotations_viz_grid_u8(
+                    batch["images"],
+                    batch["tgt_masks"],
+                    batch["tgt_points"],
+                    max_samples=1,
+                    suptitle=f"RWMD GT — {rwmd_root.name} [{i}]",
+                )
+                chw = np.transpose(grid, (2, 0, 1))
+                w.add_image(f"rwmd_gt/{stem}", chw, global_step=i, dataformats="CHW")
+        print(logdir)
+        return
+
+    if args.output_dir is not None:
+        out_dir = args.output_dir
+        if not out_dir.is_absolute():
+            out_dir = (repo / out_dir).resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(start, end):
+            sample = ds[i]
+            batch = collate_doc_batch([sample])
+            stem = Path(sample["path"]).stem
+            out_path = out_dir / f"{stem}_gt.png"
+            save_annotations_viz_grid(
+                out_path,
+                batch["images"],
+                batch["tgt_masks"],
+                batch["tgt_points"],
+                max_samples=1,
+                suptitle=f"RWMD GT — {rwmd_root.name} [{i}]",
+            )
+        print(out_dir)
+        return
+
+    index = int(args.index)
+    if index < 0 or index >= len(ds):
+        raise SystemExit(f"--index {index} out of range [0, {len(ds)})")
+    batch = collate_doc_batch([ds[index]])
 
     out_path = args.output
     if not out_path.is_absolute():
@@ -344,7 +492,7 @@ def main() -> None:
         batch["tgt_masks"],
         batch["tgt_points"],
         max_samples=1,
-        suptitle=f"RWMD GT — {rwmd_root.name} [{args.index}]",
+        suptitle=f"RWMD GT — {rwmd_root.name} [{index}]",
     )
     print(out_path)
 
