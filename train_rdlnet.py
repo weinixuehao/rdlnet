@@ -125,6 +125,12 @@ def parse_args() -> argparse.Namespace:
         help="If >0, save a snapshot every N steps to *_latest.pt (Colab disconnect recovery)",
     )
     p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help="Gradient accumulation: optimizer step every N micro-batches (effective batch ≈ batch_size × N). 1 = off.",
+    )
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument(
         "--amp",
@@ -163,15 +169,20 @@ def parse_args() -> argparse.Namespace:
         "--viz-every-steps",
         type=int,
         default=30,
-        help="Save train viz grid every N global steps (current batch); 0 disables",
+        help="Save train viz grid every N global steps (per DataLoader micro-batch); 0 disables",
     )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    accum = int(args.grad_accum_steps)
+    if accum < 1:
+        raise SystemExit("--grad-accum-steps must be >= 1")
     device = pick_device()
     print(f"device => {device}")
+    if accum > 1:
+        print(f"gradient accumulation: {accum} micro-batches per optimizer step (effective batch ≈ {args.batch_size * accum})")
 
     try:
         from torch.utils.tensorboard import SummaryWriter
@@ -280,12 +291,16 @@ def main() -> None:
             sum_mask = 0.0
             n_batches = 0
             max_batches = int(args.max_batches_per_epoch)
+            n_plan = len(loader) if max_batches <= 0 else min(len(loader), max_batches)
+            micro = 0
             for bi, batch in enumerate(tqdm(loader, desc=f"epoch {epoch + 1}/{end_epoch}", leave=True)):
                 images = batch["images"].to(device)
                 tgt_labels = [t.to(device) for t in batch["tgt_labels"]]
                 tgt_masks = [t.to(device) for t in batch["tgt_masks"]]
                 tgt_points = [t.to(device) for t in batch["tgt_points"]]
-                opt.zero_grad(set_to_none=True)
+                is_last_in_epoch = (bi + 1) == n_plan
+                if micro == 0:
+                    opt.zero_grad(set_to_none=True)
                 with torch.amp.autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
                     out = model(images)
                     loss, logs = criterion(
@@ -301,21 +316,34 @@ def main() -> None:
                         f"WARN: non-finite loss at step={global_step} (loss={float(loss.detach().cpu())}); skipping update"
                     )
                     opt.zero_grad(set_to_none=True)
+                    micro = 0
                     if use_amp:
                         scaler.update()
                     continue
+                loss_scaled = loss / accum
                 if use_amp:
-                    scaler.scale(loss).backward()
-                    if args.grad_clip_norm > 0:
-                        scaler.unscale_(opt)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
-                    scaler.step(opt)
-                    scaler.update()
+                    scaler.scale(loss_scaled).backward()
                 else:
-                    loss.backward()
-                    if args.grad_clip_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
-                    opt.step()
+                    loss_scaled.backward()
+                micro += 1
+                do_step = (micro == accum) or (is_last_in_epoch and 0 < micro < accum)
+                if do_step:
+                    if is_last_in_epoch and 0 < micro < accum:
+                        for p in model.parameters():
+                            g = p.grad
+                            if g is not None:
+                                g.mul_(accum / micro)
+                    if use_amp:
+                        if args.grad_clip_norm > 0:
+                            scaler.unscale_(opt)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                        scaler.step(opt)
+                        scaler.update()
+                    else:
+                        if args.grad_clip_norm > 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                        opt.step()
+                    micro = 0
                 epoch_loss += float(loss.detach())
                 sum_cls += float(logs["loss_cls"].item())
                 sum_dist += float(logs["loss_dist"].item())

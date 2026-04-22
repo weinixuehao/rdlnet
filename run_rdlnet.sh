@@ -4,6 +4,7 @@
 # Usage:
 #   ./run_rdlnet.sh
 #   ./run_rdlnet.sh --epochs 20 --batch-size 2
+#   ./run_rdlnet.sh --grad-accum-steps 4   # effective batch_size * 4 per optimizer step
 #   ./run_rdlnet.sh --resume checkpoints/rdlnet.pt --epochs 10
 #   RESUME=checkpoints/rdlnet.pt ./run_rdlnet.sh --epochs 10
 #
@@ -30,6 +31,9 @@ exec python train_rdlnet.py \
   --output output/rdlnet/rdlnet.pt \
   --epochs 200 \
   --batch-size 2 \
-  --num-workers 4 \
+  --grad-accum-steps 4 \
+  --lr 3e-4 \
+  --grad-clip-norm 3.0 \
+  --num-workers 6 \
   --amp \
   "$@"
