@@ -31,4 +31,5 @@ exec python train_rdlnet.py \
   --epochs 200 \
   --batch-size 2 \
   --num-workers 4 \
+  --amp \
   "$@"

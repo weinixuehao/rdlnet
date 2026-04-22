@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -252,8 +253,14 @@ def main() -> None:
         load_student_encoder_into_rdlnet_from_checkpoint(model, args.distill_checkpoint)
         print(f"Loaded student backbone from {args.distill_checkpoint}")
 
-    os.makedirs(Path(args.output).parent or ".", exist_ok=True)
-    out_path = Path(args.output)
+    p_out = Path(args.output)
+    if args.resume:
+        out_path = p_out
+    else:
+        run_ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        out_path = p_out.with_name(f"{p_out.stem}_{run_ts}{p_out.suffix}")
+    os.makedirs(out_path.parent or Path("."), exist_ok=True)
+    print(f"output checkpoint => {out_path}")
     step_ckpt = out_path.with_name(out_path.stem + "_latest.pt")
 
     tb_logdir = out_path.parent / f"{out_path.stem}_tb"
@@ -396,8 +403,8 @@ def main() -> None:
                     hist_ep, hist_loss, hist_cls, hist_dist, hist_dice, hist_mask
                 ),
             }
-            torch.save(ckpt, args.output)
-            print(f"Saved {args.output}")
+            torch.save(ckpt, out_path)
+            print(f"Saved {out_path}")
 
 
 if __name__ == "__main__":

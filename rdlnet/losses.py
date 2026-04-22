@@ -96,8 +96,10 @@ class HungarianMatcher(nn.Module):
                 pm = F.interpolate(pred_masks[i : i + 1], size=tm.shape[-2:], mode="bilinear", align_corners=False)[0]
             else:
                 pm = pred_masks[i]
-            pm = pm.sigmoid()
-            cost_m = torch.cdist(pm.flatten(1), tm.flatten(1), p=1) / (tm.shape[-1] * tm.shape[-2])
+            # torch.cdist CUDA does not support bfloat16; compute mask cost in fp32.
+            pm = pm.sigmoid().float()
+            tm_f = tm.float()
+            cost_m = torch.cdist(pm.flatten(1), tm_f.flatten(1), p=1) / (tm.shape[-1] * tm.shape[-2])
 
             # point L1 cost [Nq, Nt]
             m = _points_valid_mask_from_padding(tp)
