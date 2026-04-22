@@ -175,10 +175,15 @@ class RDLNetLoss(nn.Module):
 
             pp = pred_points[i][src_i]
             tp = tgt_points[i][tgt_i]
-            m = _points_valid_mask_from_padding(tp)
+            m = _points_valid_mask_from_padding(tp)  # [Nt, P*2] in {0,1}
             diff = (pp - tp).abs() * m
-            den = m.sum(dim=-1).clamp_min(1.0)
-            loss_dist = loss_dist + (diff.sum(dim=-1) / den).mean()
+
+            den = m.sum(dim=-1)  # [Nt]
+            valid = den > 0
+
+            if valid.any():
+                per_inst = diff.sum(dim=-1) / den.clamp_min(1.0)  # [Nt]
+                loss_dist = loss_dist + per_inst[valid].mean()
 
         n_inst = max(n_inst, 1)
         loss_cls = loss_cls / b
