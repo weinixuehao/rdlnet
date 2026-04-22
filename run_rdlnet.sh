@@ -32,8 +32,7 @@ exec python train_rdlnet.py \
   --epochs 200 \
   --batch-size 2 \
   --grad-accum-steps 4 \
-  --lr 3e-4 \
-  --grad-clip-norm 3.0 \
-  --num-workers 6 \
+  --grad-clip-norm 4.0 \
+  --num-workers 4 \
   --amp \
   "$@"

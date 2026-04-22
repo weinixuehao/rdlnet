@@ -235,6 +235,11 @@ def main() -> None:
     matcher = build_matcher(cfg)
     criterion = RDLNetLoss(cfg, matcher)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # Paper (Sec. 3.5): AdamW with LR drop by 0.1 every 40000 iterations, 160000 total iters.
+    # In this codebase, an "iteration" corresponds to a real optimizer update (i.e., after grad accumulation).
+    lr_milestones = [40_000, 80_000, 120_000]
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(opt, milestones=lr_milestones, gamma=0.1)
+    optimizer_step = 0
     use_amp = bool(args.amp and device.type == "cuda")
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -255,11 +260,20 @@ def main() -> None:
         model.load_state_dict(ck["model"])
         if "optimizer" in ck:
             opt.load_state_dict(ck["optimizer"])
+        optimizer_step = int(ck.get("optimizer_step", 0))
+        if isinstance(ck.get("scheduler"), dict):
+            scheduler.load_state_dict(ck["scheduler"])
+        else:
+            # Backward-compatible resume for older checkpoints (no scheduler saved).
+            # Align internal scheduler counter to the restored optimizer_step.
+            scheduler.last_epoch = optimizer_step - 1
         start_epoch = int(ck.get("epoch", 0))
         global_step = int(ck.get("global_step", 0))
         hist_ep, hist_loss, hist_cls, hist_dist, hist_dice, hist_mask = load_loss_history_from_ck(ck)
         del ck
-        print(f"Resumed from {args.resume}: epoch={start_epoch}, global_step={global_step}")
+        print(
+            f"Resumed from {args.resume}: epoch={start_epoch}, global_step={global_step}, optimizer_step={optimizer_step}"
+        )
     elif args.distill_checkpoint:
         load_student_encoder_into_rdlnet_from_checkpoint(model, args.distill_checkpoint)
         print(f"Loaded student backbone from {args.distill_checkpoint}")
@@ -343,6 +357,9 @@ def main() -> None:
                         if args.grad_clip_norm > 0:
                             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
                         opt.step()
+                    optimizer_step += 1
+                    scheduler.step()
+                    tb.add_scalar("train/lr", float(opt.param_groups[0]["lr"]), global_step=optimizer_step)
                     micro = 0
                 epoch_loss += float(loss.detach())
                 sum_cls += float(logs["loss_cls"].item())
@@ -385,9 +402,11 @@ def main() -> None:
                         {
                             "model": model.state_dict(),
                             "optimizer": opt.state_dict(),
+                            "scheduler": scheduler.state_dict(),
                             "config": asdict(cfg),
                             "epoch": epoch,
                             "global_step": global_step,
+                            "optimizer_step": optimizer_step,
                             "note": "mid-epoch",
                         },
                         step_ckpt,
@@ -424,9 +443,11 @@ def main() -> None:
             ckpt: dict[str, Any] = {
                 "model": model.state_dict(),
                 "optimizer": opt.state_dict(),
+                "scheduler": scheduler.state_dict(),
                 "config": asdict(cfg),
                 "epoch": ep_no,
                 "global_step": global_step,
+                "optimizer_step": optimizer_step,
                 LOSS_HISTORY_KEY: pack_loss_history(
                     hist_ep, hist_loss, hist_cls, hist_dist, hist_dice, hist_mask
                 ),
