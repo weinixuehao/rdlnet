@@ -346,6 +346,7 @@ def genarate_label_from_ori(src_dir, dst_dir):
     src_root = os.path.abspath(os.path.normpath(src_dir))
 
     points_json = {}
+    fgdoc_not4_img_paths: list[str] = []
     os.makedirs(os.path.join(dst_dir, "img"), exist_ok=True)
     os.makedirs(os.path.join(dst_dir, "mask"), exist_ok=True)
 
@@ -383,6 +384,8 @@ def genarate_label_from_ori(src_dir, dst_dir):
                     pts = _strip_closing_vertex_xy(pts)
                     if pts.shape[0] == 4:
                         foreground_quad = _order_quad_tl_tr_br_bl(pts).astype(np.int32)
+                    else:
+                        fgdoc_not4_img_paths.append(img_p)
                     continue
                 if not (isinstance(lab, str) and lab.isdigit()):
                     continue
@@ -441,6 +444,12 @@ def genarate_label_from_ori(src_dir, dst_dir):
             cv2.imwrite(os.path.join(dst_dir, "mask", out_png), mask_png)
     with open(f"{dst_dir}/label_points.json", "w", encoding="utf-8") as f:
         json.dump(points_json, f, indent=4, ensure_ascii=False)
+
+    if fgdoc_not4_img_paths:
+        out_txt = os.path.join(dst_dir, "foreground_doc_points_not4.txt")
+        with open(out_txt, "w", encoding="utf-8") as f:
+            for p in fgdoc_not4_img_paths:
+                f.write(str(p) + "\n")
 
 
 def rotate_img(root_dir, out_dir):
