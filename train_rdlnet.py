@@ -122,7 +122,7 @@ def parse_args() -> argparse.Namespace:
         "--save-every-steps",
         type=int,
         default=0,
-        help="If >0, save a snapshot every N steps to *_latest.pt (Colab disconnect recovery)",
+        help="If >0, save a snapshot every N optimizer steps to *_latest.pt (Colab disconnect recovery)",
     )
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument(
@@ -169,7 +169,7 @@ def parse_args() -> argparse.Namespace:
         "--viz-every-steps",
         type=int,
         default=30,
-        help="Save train viz grid every N global steps (per DataLoader micro-batch); 0 disables",
+        help="Save train viz grid every N optimizer steps (after grad accumulation); 0 disables",
     )
     return p.parse_args()
 
@@ -254,7 +254,6 @@ def main() -> None:
     hist_mask: list[float] = []
 
     start_epoch = 0
-    global_step = 0
     if args.resume:
         ck = torch.load(args.resume, map_location=device)
         model.load_state_dict(ck["model"])
@@ -268,11 +267,10 @@ def main() -> None:
             # Align internal scheduler counter to the restored optimizer_step.
             scheduler.last_epoch = optimizer_step - 1
         start_epoch = int(ck.get("epoch", 0))
-        global_step = int(ck.get("global_step", 0))
         hist_ep, hist_loss, hist_cls, hist_dist, hist_dice, hist_mask = load_loss_history_from_ck(ck)
         del ck
         print(
-            f"Resumed from {args.resume}: epoch={start_epoch}, global_step={global_step}, optimizer_step={optimizer_step}"
+            f"Resumed from {args.resume}: epoch={start_epoch}, optimizer_step={optimizer_step}"
         )
     elif args.distill_checkpoint:
         load_student_encoder_into_rdlnet_from_checkpoint(model, args.distill_checkpoint)
@@ -327,7 +325,7 @@ def main() -> None:
                     )
                 if not torch.isfinite(loss).item():
                     tqdm.write(
-                        f"WARN: non-finite loss at step={global_step} (loss={float(loss.detach().cpu())}); skipping update"
+                        f"WARN: non-finite loss at step={optimizer_step} (loss={float(loss.detach().cpu())}); skipping update"
                     )
                     opt.zero_grad(set_to_none=True)
                     micro = 0
@@ -347,19 +345,65 @@ def main() -> None:
                             g = p.grad
                             if g is not None:
                                 g.mul_(accum / micro)
-                    if use_amp:
-                        if args.grad_clip_norm > 0:
+                    if args.grad_clip_norm > 0:
+                        if use_amp:
                             scaler.unscale_(opt)
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                    if use_amp:
                         scaler.step(opt)
                         scaler.update()
                     else:
-                        if args.grad_clip_norm > 0:
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
                         opt.step()
                     optimizer_step += 1
                     scheduler.step()
                     tb.add_scalar("train/lr", float(opt.param_groups[0]["lr"]), global_step=optimizer_step)
+
+                    if (
+                        args.viz_samples > 0
+                        and args.viz_every_steps > 0
+                        and optimizer_step % args.viz_every_steps == 0
+                    ):
+                        with torch.no_grad():
+                            _mi = criterion.matcher(
+                                out["pred_logits"],
+                                out["pred_masks"],
+                                out["pred_points"],
+                                tgt_labels,
+                                tgt_masks,
+                                tgt_points,
+                            )
+                        matched_indices = [(a.cpu(), b.cpu()) for a, b in _mi]
+                        grid_u8 = train_compare_grid_u8(
+                            images.detach().cpu(),
+                            {k: v.detach().cpu() for k, v in out.items()},
+                            [t.detach().cpu() for t in tgt_labels],
+                            [t.detach().cpu() for t in tgt_masks],
+                            [t.detach().cpu() for t in tgt_points],
+                            max_samples=args.viz_samples,
+                            matched_indices=matched_indices,
+                        )
+                        chw = np.transpose(grid_u8, (2, 0, 1))
+                        tb.add_image(
+                            f"train/compare_grid/epoch_{epoch + 1:04d}/step_{optimizer_step:08d}",
+                            chw,
+                            global_step=optimizer_step,
+                            dataformats="CHW",
+                        )
+
+                    if args.save_every_steps > 0 and optimizer_step % args.save_every_steps == 0:
+                        torch.save(
+                            {
+                                "model": model.state_dict(),
+                                "optimizer": opt.state_dict(),
+                                "scheduler": scheduler.state_dict(),
+                                "config": asdict(cfg),
+                                "epoch": epoch,
+                                "optimizer_step": optimizer_step,
+                                "note": "mid-epoch",
+                            },
+                            step_ckpt,
+                        )
+                        tqdm.write(f"Saved step checkpoint -> {step_ckpt}")
                     micro = 0
                 epoch_loss += float(loss.detach())
                 sum_cls += float(logs["loss_cls"].item())
@@ -367,51 +411,6 @@ def main() -> None:
                 sum_dice += float(logs["loss_dice"].item())
                 sum_mask += float(logs["loss_mask"].item())
                 n_batches += 1
-                global_step += 1
-
-                if args.viz_samples > 0 and args.viz_every_steps > 0 and global_step % args.viz_every_steps == 0:
-                    with torch.no_grad():
-                        _mi = criterion.matcher(
-                            out["pred_logits"],
-                            out["pred_masks"],
-                            out["pred_points"],
-                            tgt_labels,
-                            tgt_masks,
-                            tgt_points,
-                        )
-                    matched_indices = [(a.cpu(), b.cpu()) for a, b in _mi]
-                    grid_u8 = train_compare_grid_u8(
-                        images.detach().cpu(),
-                        {k: v.detach().cpu() for k, v in out.items()},
-                        [t.detach().cpu() for t in tgt_labels],
-                        [t.detach().cpu() for t in tgt_masks],
-                        [t.detach().cpu() for t in tgt_points],
-                        max_samples=args.viz_samples,
-                        matched_indices=matched_indices,
-                    )
-                    chw = np.transpose(grid_u8, (2, 0, 1))
-                    tb.add_image(
-                        f"train/compare_grid/epoch_{epoch + 1:04d}/step_{global_step:08d}",
-                        chw,
-                        global_step=global_step,
-                        dataformats="CHW",
-                    )
-
-                if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
-                    torch.save(
-                        {
-                            "model": model.state_dict(),
-                            "optimizer": opt.state_dict(),
-                            "scheduler": scheduler.state_dict(),
-                            "config": asdict(cfg),
-                            "epoch": epoch,
-                            "global_step": global_step,
-                            "optimizer_step": optimizer_step,
-                            "note": "mid-epoch",
-                        },
-                        step_ckpt,
-                    )
-                    tqdm.write(f"Saved step checkpoint -> {step_ckpt}")
                 if max_batches > 0 and (bi + 1) >= max_batches:
                     break
 
@@ -446,7 +445,6 @@ def main() -> None:
                 "scheduler": scheduler.state_dict(),
                 "config": asdict(cfg),
                 "epoch": ep_no,
-                "global_step": global_step,
                 "optimizer_step": optimizer_step,
                 LOSS_HISTORY_KEY: pack_loss_history(
                     hist_ep, hist_loss, hist_cls, hist_dist, hist_dice, hist_mask
