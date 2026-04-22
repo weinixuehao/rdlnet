@@ -29,7 +29,7 @@ import argparse
 import os
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +49,38 @@ from rdlnet.model import RDLNet, RDLNetConfig
 from rdlnet.viz_rdlnet import train_compare_grid_u8
 
 LOSS_HISTORY_KEY = "train_rdlnet_loss_history"
+
+
+@dataclass
+class LossSums:
+    total: float = 0.0
+    cls: float = 0.0
+    dist: float = 0.0
+    dice: float = 0.0
+    mask: float = 0.0
+    n: int = 0
+
+    def update(self, loss: torch.Tensor, logs: dict[str, torch.Tensor]) -> None:
+        self.total += float(loss.detach())
+        self.cls += float(logs["loss_cls"].item())
+        self.dist += float(logs["loss_dist"].item())
+        self.dice += float(logs["loss_dice"].item())
+        self.mask += float(logs["loss_mask"].item())
+        self.n += 1
+
+    def averages(self) -> dict[str, float]:
+        denom = max(self.n, 1)
+        return {
+            "total": self.total / denom,
+            "cls": self.cls / denom,
+            "dist": self.dist / denom,
+            "dice": self.dice / denom,
+            "mask": self.mask / denom,
+        }
+
+
+def _should_stop(i: int, max_batches: int) -> bool:
+    return max_batches > 0 and (i + 1) >= max_batches
 
 
 def pack_loss_history(
@@ -88,6 +120,39 @@ def load_loss_history_from_ck(ck: dict) -> tuple[list[int], list[float], list[fl
     return ep[:n], lo[:n], lc[:n], ld[:n], ldi[:n], lm[:n]
 
 
+def _batch_to_device(batch: dict[str, Any], device: torch.device) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    images = batch["images"].to(device)
+    tgt_labels = [t.to(device) for t in batch["tgt_labels"]]
+    tgt_masks = [t.to(device) for t in batch["tgt_masks"]]
+    tgt_points = [t.to(device) for t in batch["tgt_points"]]
+    return images, tgt_labels, tgt_masks, tgt_points
+
+
+def _forward_and_loss(
+    model: torch.nn.Module,
+    criterion: RDLNetLoss,
+    images: torch.Tensor,
+    tgt_labels: list[torch.Tensor],
+    tgt_masks: list[torch.Tensor],
+    tgt_points: list[torch.Tensor],
+    *,
+    device_type: str,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor, dict[str, torch.Tensor]]:
+    with torch.amp.autocast(device_type=device_type, enabled=use_amp, dtype=amp_dtype):
+        out = model(images)
+        loss, logs = criterion(
+            out["pred_logits"],
+            out["pred_masks"],
+            out["pred_points"],
+            tgt_labels,
+            tgt_masks,
+            tgt_points,
+        )
+    return out, loss, logs
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Stage 2: train RDLNet on annotated documents")
     p.add_argument("--annotations", type=str, default=None, help="JSON list (see rdlnet.data.doc_json)")
@@ -97,6 +162,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="RWMD preprocessed folder: img/, mask/, label_points_resize.json (see data_preprocessing_rwdm_1.py).",
+    )
+    p.add_argument(
+        "--val-rwmd-root",
+        type=str,
+        default=None,
+        help="Optional RWMD preprocessed folder for validation (img/, mask/, label_points_resize.json).",
     )
     p.add_argument(
         "--num-classes",
@@ -222,14 +293,37 @@ def main() -> None:
             num_points=cfg.num_points,
             max_instances=cfg.num_queries,
         )
+
+    if args.val_rwmd_root:
+        train_ds, val_ds = ds, RWMDLabelMeDataset(
+            args.val_rwmd_root,
+            img_size=args.img_size,
+            num_classes=cfg.num_classes,
+            num_points=cfg.num_points,
+            max_instances=cfg.num_queries,
+        )
+        print(f"val dataset => RWMDLabelMeDataset({args.val_rwmd_root})")
+    else:
+        train_ds, val_ds = ds, None
+
     loader = DataLoader(
-        ds,
+        train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         collate_fn=collate_doc_batch,
         pin_memory=device.type == "cuda",
     )
+    val_loader = None
+    if val_ds is not None:
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=collate_doc_batch,
+            pin_memory=device.type == "cuda",
+        )
 
     model = RDLNet(cfg).to(device)
     matcher = build_matcher(cfg)
@@ -296,33 +390,26 @@ def main() -> None:
     with SummaryWriter(log_dir=str(tb_logdir)) as tb:
         for epoch in range(start_epoch, end_epoch):
             model.train()
-            epoch_loss = 0.0
-            sum_cls = 0.0
-            sum_dist = 0.0
-            sum_dice = 0.0
-            sum_mask = 0.0
-            n_batches = 0
+            sums = LossSums()
             max_batches = int(args.max_batches_per_epoch)
             n_plan = len(loader) if max_batches <= 0 else min(len(loader), max_batches)
             micro = 0
             for bi, batch in enumerate(tqdm(loader, desc=f"epoch {epoch + 1}/{end_epoch}", leave=True)):
-                images = batch["images"].to(device)
-                tgt_labels = [t.to(device) for t in batch["tgt_labels"]]
-                tgt_masks = [t.to(device) for t in batch["tgt_masks"]]
-                tgt_points = [t.to(device) for t in batch["tgt_points"]]
+                images, tgt_labels, tgt_masks, tgt_points = _batch_to_device(batch, device)
                 is_last_in_epoch = (bi + 1) == n_plan
                 if micro == 0:
                     opt.zero_grad(set_to_none=True)
-                with torch.amp.autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
-                    out = model(images)
-                    loss, logs = criterion(
-                        out["pred_logits"],
-                        out["pred_masks"],
-                        out["pred_points"],
-                        tgt_labels,
-                        tgt_masks,
-                        tgt_points,
-                    )
+                out, loss, logs = _forward_and_loss(
+                    model,
+                    criterion,
+                    images,
+                    tgt_labels,
+                    tgt_masks,
+                    tgt_points,
+                    device_type=device.type,
+                    use_amp=use_amp,
+                    amp_dtype=amp_dtype,
+                )
                 if not torch.isfinite(loss).item():
                     tqdm.write(
                         f"WARN: non-finite loss at step={optimizer_step} (loss={float(loss.detach().cpu())}); skipping update"
@@ -405,39 +492,52 @@ def main() -> None:
                         )
                         tqdm.write(f"Saved step checkpoint -> {step_ckpt}")
                     micro = 0
-                epoch_loss += float(loss.detach())
-                sum_cls += float(logs["loss_cls"].item())
-                sum_dist += float(logs["loss_dist"].item())
-                sum_dice += float(logs["loss_dice"].item())
-                sum_mask += float(logs["loss_mask"].item())
-                n_batches += 1
-                if max_batches > 0 and (bi + 1) >= max_batches:
+                sums.update(loss, logs)
+                if _should_stop(bi, max_batches):
                     break
 
-            nb = max(n_batches, 1)
-            avg = epoch_loss / nb
-            avg_cls = sum_cls / nb
-            avg_dist = sum_dist / nb
-            avg_dice = sum_dice / nb
-            avg_mask = sum_mask / nb
+            av = sums.averages()
             ep_no = epoch + 1
             hist_ep.append(ep_no)
-            hist_loss.append(avg)
-            hist_cls.append(avg_cls)
-            hist_dist.append(avg_dist)
-            hist_dice.append(avg_dice)
-            hist_mask.append(avg_mask)
+            hist_loss.append(av["total"])
+            hist_cls.append(av["cls"])
+            hist_dist.append(av["dist"])
+            hist_dice.append(av["dice"])
+            hist_mask.append(av["mask"])
             tb.add_scalars(
                 "train_epoch/losses",
-                {
-                    "total": avg,
-                    "cls": avg_cls,
-                    "dist": avg_dist,
-                    "dice": avg_dice,
-                    "mask": avg_mask,
-                },
+                av,
                 global_step=ep_no,
             )
+
+            if val_loader is not None:
+                model.eval()
+                v_sums = LossSums()
+                with torch.no_grad():
+                    for vbi, batch in enumerate(tqdm(val_loader, desc=f"val {epoch + 1}/{end_epoch}", leave=False)):
+                        images, tgt_labels, tgt_masks, tgt_points = _batch_to_device(batch, device)
+                        _, loss, logs = _forward_and_loss(
+                            model,
+                            criterion,
+                            images,
+                            tgt_labels,
+                            tgt_masks,
+                            tgt_points,
+                            device_type=device.type,
+                            use_amp=use_amp,
+                            amp_dtype=amp_dtype,
+                        )
+                        if not torch.isfinite(loss).item():
+                            continue
+                        v_sums.update(loss, logs)
+                        if _should_stop(vbi, max_batches):
+                            break
+                tb.add_scalars(
+                    "val_epoch/losses",
+                    v_sums.averages(),
+                    global_step=ep_no,
+                )
+                model.train()
 
             ckpt: dict[str, Any] = {
                 "model": model.state_dict(),
