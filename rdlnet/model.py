@@ -305,9 +305,9 @@ class RDLNet(nn.Module):
         scale = 1.0 / math.sqrt(cfg.hidden_dim)
 
         def bias_from_hr(logits_hw: Tensor) -> Tensor:
-            pad = logits_hw.new_zeros(b, cfg.num_queries, nm_full)
-            pad[:, :, :mem_hr_len] = logits_hw * scale
-            return pad
+            # Avoid slice assignment (aten.slice_scatter), which can break some export/conversion backends.
+            tail = logits_hw.new_zeros(b, cfg.num_queries, nm_full - mem_hr_len)
+            return torch.cat([logits_hw * scale, tail], dim=2)
 
         attn_bias = bias_from_hr(prior_logits.flatten(2))
 
