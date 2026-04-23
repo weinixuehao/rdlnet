@@ -223,6 +223,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--img-size", type=int, default=1024)
+    p.add_argument(
+        "--lite",
+        type=int,
+        default=40,
+        choices=[40, 20],
+        help="Lightweight preset: 40 = default (paper-ish), 20 = smaller backbone/decoder dims.",
+    )
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument(
         "--max-batches-per-epoch",
@@ -243,6 +250,49 @@ def parse_args() -> argparse.Namespace:
         help="Save train viz grid every N optimizer steps (after grad accumulation); 0 disables",
     )
     return p.parse_args()
+
+
+def _quad_iou_from_points_norm(
+    pred_pts_flat: torch.Tensor,
+    gt_pts_flat: torch.Tensor,
+    *,
+    h: int,
+    w: int,
+    n_corners: int = 4,
+) -> float:
+    """Compute polygon IoU (JI) from normalized corner points in [0,1].
+
+    Points are expected to be ordered (TL/TR/BR/BL). Uses rasterization for robustness.
+    """
+    import numpy as np
+    import cv2
+
+    def _to_poly(pts_flat: torch.Tensor) -> np.ndarray | None:
+        pts = pts_flat.detach().float().view(-1, 2)[:n_corners].cpu().numpy()
+        if pts.size == 0:
+            return None
+        if np.any(pts < 0.0):
+            raise ValueError("Invalid corner points: negative values found (expected normalized 0..1).")
+        xs = np.clip(pts[:, 0] * float(max(w - 1, 1)), 0.0, float(max(w - 1, 1)))
+        ys = np.clip(pts[:, 1] * float(max(h - 1, 1)), 0.0, float(max(h - 1, 1)))
+        poly = np.stack([xs, ys], axis=1)
+        poly = np.round(poly).astype(np.int32)
+        return poly.reshape(-1, 1, 2)
+
+    p_poly = _to_poly(pred_pts_flat)
+    g_poly = _to_poly(gt_pts_flat)
+    if p_poly is None or g_poly is None:
+        raise ValueError("Empty corner points (expected at least 4 points).")
+
+    pm = np.zeros((h, w), dtype=np.uint8)
+    gm = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(pm, [p_poly], 1)
+    cv2.fillPoly(gm, [g_poly], 1)
+    inter = int((pm & gm).sum())
+    union = int((pm | gm).sum())
+    if union <= 0:
+        return 1.0
+    return float(inter) / float(union)
 
 
 def main() -> None:
@@ -271,6 +321,11 @@ def main() -> None:
         num_classes=num_classes,
         use_sam_pixel_norm=True,
     )
+    if int(args.lite) == 20:
+        # Keep heads unchanged (8) so dims remain divisible.
+        cfg.backbone_dim = 256
+        cfg.hidden_dim = 192
+        cfg.ffn_dim = 1024
     if args.img_size % cfg.patch_size != 0:
         raise ValueError("img_size must be divisible by patch_size")
 
@@ -358,7 +413,7 @@ def main() -> None:
     hist_mask: list[float] = []
 
     start_epoch = 0
-    best_val_loss = float("inf")
+    best_val_ji = float("-inf")
     if args.resume:
         ck = torch.load(args.resume, map_location=device)
         model.load_state_dict(ck["model"])
@@ -373,8 +428,8 @@ def main() -> None:
             scheduler.last_epoch = optimizer_step - 1
         start_epoch = int(ck.get("epoch", 0))
         hist_ep, hist_loss, hist_cls, hist_dist, hist_dice, hist_mask = load_loss_history_from_ck(ck)
-        if isinstance(ck.get("best_val_loss"), (int, float)):
-            best_val_loss = float(ck["best_val_loss"])
+        if isinstance(ck.get("best_val_ji"), (int, float)):
+            best_val_ji = float(ck["best_val_ji"])
         del ck
         print(
             f"Resumed from {args.resume}: epoch={start_epoch}, optimizer_step={optimizer_step}"
@@ -525,13 +580,16 @@ def main() -> None:
             )
 
             val_loss: float | None = None
+            val_ji: float | None = None
             if val_loader is not None:
                 model.eval()
                 v_sums = LossSums()
+                ji_sum = 0.0
+                ji_n = 0
                 with torch.no_grad():
                     for vbi, batch in enumerate(tqdm(val_loader, desc=f"val {epoch + 1}/{end_epoch}", leave=False)):
                         images, tgt_labels, tgt_masks, tgt_points = _batch_to_device(batch, device)
-                        _, loss, logs = _forward_and_loss(
+                        out, loss, logs = _forward_and_loss(
                             model,
                             criterion,
                             images,
@@ -545,15 +603,43 @@ def main() -> None:
                         if not torch.isfinite(loss).item():
                             continue
                         v_sums.update(loss, logs)
+                        # JI (IoU) from main document quad corners (class_id=0).
+                        probs0 = torch.softmax(out["pred_logits"].detach(), dim=-1)[..., 0]  # [B, Nq]
+                        q_best = torch.argmax(probs0, dim=1)  # [B]
+                        bsz = images.shape[0]
+                        h, w = int(images.shape[2]), int(images.shape[3])
+                        for i in range(bsz):
+                            tl = tgt_labels[i].long()
+                            fg = (tl == 0).nonzero(as_tuple=False).view(-1)
+                            if fg.numel() != 1:
+                                raise ValueError(
+                                    f"Expected exactly 1 foreground instance with label==0 per image, got {int(fg.numel())}. "
+                                    "This indicates a data issue."
+                                )
+                            gi = int(fg[0].item())
+                            pi = int(q_best[i].item())
+                            ji = _quad_iou_from_points_norm(
+                                out["pred_points"][i, pi],
+                                tgt_points[i][gi],
+                                h=h,
+                                w=w,
+                                n_corners=4,
+                            )
+                            ji_sum += float(ji)
+                            ji_n += 1
                         if _should_stop(vbi, max_batches):
                             break
                 v_av = v_sums.averages()
                 val_loss = float(v_av["total"])
+                if ji_n > 0:
+                    val_ji = float(ji_sum / ji_n)
                 tb.add_scalars(
                     "val_epoch/losses",
                     v_av,
                     global_step=ep_no,
                 )
+                if val_ji is not None:
+                    tb.add_scalar("val_epoch/ji", val_ji, global_step=ep_no)
                 model.train()
 
             ckpt: dict[str, Any] = {
@@ -564,20 +650,21 @@ def main() -> None:
                 "epoch": ep_no,
                 "optimizer_step": optimizer_step,
                 "val_loss": val_loss,
-                "best_val_loss": best_val_loss,
+                "val_ji": val_ji,
+                "best_val_ji": best_val_ji,
                 LOSS_HISTORY_KEY: pack_loss_history(
                     hist_ep, hist_loss, hist_cls, hist_dist, hist_dice, hist_mask
                 ),
             }
             torch.save(ckpt, out_path)
 
-            if val_loss is not None and val_loss < best_val_loss:
-                best_val_loss = val_loss
+            if val_ji is not None and val_ji > best_val_ji:
+                best_val_ji = val_ji
                 best_ckpt = dict(ckpt)
-                best_ckpt["best_val_loss"] = best_val_loss
+                best_ckpt["best_val_ji"] = best_val_ji
                 best_ckpt["is_best"] = True
                 torch.save(best_ckpt, best_ckpt_path)
-                print(f"Saved best checkpoint -> {best_ckpt_path} (val_loss={best_val_loss:.6g})")
+                print(f"Saved best checkpoint -> {best_ckpt_path} (val_ji={best_val_ji:.6g})")
 
 
 if __name__ == "__main__":

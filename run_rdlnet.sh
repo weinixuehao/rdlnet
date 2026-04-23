@@ -26,6 +26,7 @@ fi
 
 exec python train_rdlnet.py \
   --rwmd-root "output/data/train_resize" \
+  --val-rwmd-root "output/data/test_resize" \
   --num-classes 2 \
   --distill-checkpoint checkpoints/distill_stage1.pt \
   --output output/rdlnet/rdlnet.pt \
@@ -35,4 +36,5 @@ exec python train_rdlnet.py \
   --grad-clip-norm 4.0 \
   --num-workers 4 \
   --amp \
+  --lite 20 \
   "$@"
