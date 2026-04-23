@@ -47,6 +47,11 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Export batch size (fixed).",
     )
+    p.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Enable FP16 weight quantization in TFLite converter (smaller model; I/O stays float32).",
+    )
     return p.parse_args()
 
 
@@ -80,6 +85,7 @@ def export_tflite(
     input_range: str,
     batch: int,
     export: str,
+    fp16: bool,
 ) -> Path:
     import torch
     import torch.nn as nn
@@ -133,7 +139,18 @@ def export_tflite(
 
     out_dir.mkdir(parents=True, exist_ok=True)
     tflite_path = out_dir / ("rdlnet_points.tflite" if export == "points" else "rdlnet_full.tflite")
-    edge_model = litert_torch.convert(wrapped, (dummy,))
+    ai_edge_flags = None
+    if fp16:
+        # LiteRT Torch goes through TF Lite converter; this sets "float16 weight quantization".
+        # https://www.tensorflow.org/lite/performance/post_training_quantization#float16_quantization
+        import tensorflow as tf
+
+        ai_edge_flags = {
+            "optimizations": [tf.lite.Optimize.DEFAULT],
+            "target_spec": {"supported_types": [tf.float16]},
+        }
+
+    edge_model = litert_torch.convert(wrapped, (dummy,), _ai_edge_converter_flags=ai_edge_flags)
     edge_model.export(str(tflite_path))
     return tflite_path
 
@@ -154,6 +171,7 @@ def main() -> None:
         input_range=str(args.input_range),
         batch=int(args.batch),
         export=str(args.export),
+        fp16=bool(args.fp16),
     )
     print(f"TFLite exported -> {tflite_path}")
 

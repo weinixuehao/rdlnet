@@ -326,6 +326,16 @@ def main() -> None:
         )
 
     model = RDLNet(cfg).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    mb_fp32 = n_params * 4 / (1024 * 1024)
+    mb_fp16 = n_params * 2 / (1024 * 1024)
+    print(
+        "model params => "
+        f"total={n_params:,} ({n_params/1e6:.2f}M), "
+        f"trainable={n_trainable:,} ({n_trainable/1e6:.2f}M), "
+        f"weights≈{mb_fp32:.1f}MB(fp32) / {mb_fp16:.1f}MB(fp16)"
+    )
     matcher = build_matcher(cfg)
     criterion = RDLNetLoss(cfg, matcher)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)

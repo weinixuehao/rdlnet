@@ -10,6 +10,7 @@ OUT_DIR="${2:-${ROOT}/output/_export_rdlnet}"
 IMG_SIZE="${3:-1024}"
 EXPORT_MODE="${4:-points}"   # points|full
 INPUT_RANGE="${5:-0_1}"      # 0_1|0_255
+FP16="${6:-0}"               # 0|1
 
 cd "${ROOT}"
 
@@ -25,5 +26,6 @@ exec "${PY}" "${ROOT}/scripts/export_rdlnet_tflite.py" \
   --img-size "${IMG_SIZE}" \
   --use-sam-pixel-norm \
   --input-range "${INPUT_RANGE}" \
-  --export "${EXPORT_MODE}"
+  --export "${EXPORT_MODE}" \
+  $( [[ "${FP16}" == "1" ]] && echo "--fp16" )
 
