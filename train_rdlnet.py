@@ -348,6 +348,7 @@ def main() -> None:
     hist_mask: list[float] = []
 
     start_epoch = 0
+    best_val_loss = float("inf")
     if args.resume:
         ck = torch.load(args.resume, map_location=device)
         model.load_state_dict(ck["model"])
@@ -362,6 +363,8 @@ def main() -> None:
             scheduler.last_epoch = optimizer_step - 1
         start_epoch = int(ck.get("epoch", 0))
         hist_ep, hist_loss, hist_cls, hist_dist, hist_dice, hist_mask = load_loss_history_from_ck(ck)
+        if isinstance(ck.get("best_val_loss"), (int, float)):
+            best_val_loss = float(ck["best_val_loss"])
         del ck
         print(
             f"Resumed from {args.resume}: epoch={start_epoch}, optimizer_step={optimizer_step}"
@@ -379,6 +382,7 @@ def main() -> None:
     os.makedirs(out_path.parent or Path("."), exist_ok=True)
     print(f"output checkpoint => {out_path}")
     step_ckpt = out_path.with_name(out_path.stem + "_latest.pt")
+    best_ckpt_path = out_path.with_name(out_path.stem + "_best.pt")
 
     tb_logdir = out_path.parent / f"{out_path.stem}_tb"
     tb_logdir.mkdir(parents=True, exist_ok=True)
@@ -510,6 +514,7 @@ def main() -> None:
                 global_step=ep_no,
             )
 
+            val_loss: float | None = None
             if val_loader is not None:
                 model.eval()
                 v_sums = LossSums()
@@ -532,9 +537,11 @@ def main() -> None:
                         v_sums.update(loss, logs)
                         if _should_stop(vbi, max_batches):
                             break
+                v_av = v_sums.averages()
+                val_loss = float(v_av["total"])
                 tb.add_scalars(
                     "val_epoch/losses",
-                    v_sums.averages(),
+                    v_av,
                     global_step=ep_no,
                 )
                 model.train()
@@ -546,12 +553,21 @@ def main() -> None:
                 "config": asdict(cfg),
                 "epoch": ep_no,
                 "optimizer_step": optimizer_step,
+                "val_loss": val_loss,
+                "best_val_loss": best_val_loss,
                 LOSS_HISTORY_KEY: pack_loss_history(
                     hist_ep, hist_loss, hist_cls, hist_dist, hist_dice, hist_mask
                 ),
             }
             torch.save(ckpt, out_path)
-            print(f"Saved {out_path}")
+
+            if val_loss is not None and val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_ckpt = dict(ckpt)
+                best_ckpt["best_val_loss"] = best_val_loss
+                best_ckpt["is_best"] = True
+                torch.save(best_ckpt, best_ckpt_path)
+                print(f"Saved best checkpoint -> {best_ckpt_path} (val_loss={best_val_loss:.6g})")
 
 
 if __name__ == "__main__":
