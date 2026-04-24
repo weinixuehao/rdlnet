@@ -588,6 +588,7 @@ def main() -> None:
                 ji_n = 0
                 with torch.no_grad():
                     for vbi, batch in enumerate(tqdm(val_loader, desc=f"val {epoch + 1}/{end_epoch}", leave=False)):
+                        paths = batch.get("paths") or []
                         images, tgt_labels, tgt_masks, tgt_points = _batch_to_device(batch, device)
                         out, loss, logs = _forward_and_loss(
                             model,
@@ -608,19 +609,29 @@ def main() -> None:
                         q_best = torch.argmax(probs0, dim=1)  # [B]
                         bsz = images.shape[0]
                         h, w = int(images.shape[2]), int(images.shape[3])
+                        if not paths:
+                            paths = ["?"] * int(bsz)
                         for i in range(bsz):
                             tl = tgt_labels[i].long()
                             fg = (tl == 0).nonzero(as_tuple=False).view(-1)
                             if fg.numel() != 1:
                                 raise ValueError(
-                                    f"Expected exactly 1 foreground instance with label==0 per image, got {int(fg.numel())}. "
-                                    "This indicates a data issue."
+                                    f"Expected exactly 1 main document (label==0) per image, got {int(fg.numel())}. "
+                                    f"path={paths[i]}"
                                 )
                             gi = int(fg[0].item())
                             pi = int(q_best[i].item())
+                            gt_pts_flat = tgt_points[i][gi]
+                            # If label==0 exists, its first 4 corners must be valid normalized coords.
+                            # Otherwise RWMD `label_points_resize.json` likely missed this image.
+                            if torch.any(gt_pts_flat[: 4 * 2] < 0).item():
+                                raise ValueError(
+                                    "Invalid GT corners for label==0 (expected 4 valid normalized points in [0,1]). "
+                                    f"path={paths[i]} gt_first8={gt_pts_flat[:8].detach().cpu().tolist()}"
+                                )
                             ji = _quad_iou_from_points_norm(
                                 out["pred_points"][i, pi],
-                                tgt_points[i][gi],
+                                gt_pts_flat,
                                 h=h,
                                 w=w,
                                 n_corners=4,

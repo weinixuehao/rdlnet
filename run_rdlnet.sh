@@ -24,18 +24,18 @@ if [ -n "${RESUME:-}" ]; then
   set -- --resume "$RESUME" "$@"
 fi
 
+  # --resume output/rdlnet/rdlnet_20260422_154944.pt \
+  # --distill-checkpoint checkpoints/distill_stage1.pt \
 exec python train_rdlnet.py \
   --rwmd-root "output/data/train_resize" \
   --val-rwmd-root "output/data/test_resize" \
   --num-classes 2 \
-  --distill-checkpoint checkpoints/distill_stage1.pt \
-  --output output/rdlnet/rdlnet_20260422_154944.pt \
-  --resume output/rdlnet/rdlnet_20260422_154944.pt \
+  --output output/rdlnet/rdlnet.pt \
+  --lite 20 \
   --epochs 500 \
   --batch-size 2 \
   --grad-accum-steps 4 \
   --grad-clip-norm 4.0 \
   --num-workers 4 \
   --amp \
-  --lite 20 \
   "$@"
