@@ -5,8 +5,8 @@
 #   ./run_rdlnet.sh
 #   ./run_rdlnet.sh --epochs 20 --batch-size 2
 #   ./run_rdlnet.sh --grad-accum-steps 4   # effective batch_size * 4 per optimizer step
-#   ./run_rdlnet.sh --resume checkpoints/rdlnet.pt --epochs 10
-#   RESUME=checkpoints/rdlnet.pt ./run_rdlnet.sh --epochs 10
+#   ./run_rdlnet.sh --resume output/rdlnet/20250424_153022 --epochs 10
+#   RESUME=output/rdlnet/20250424_153022 ./run_rdlnet.sh --epochs 10
 #
 # Do not set RESUME and also pass --resume (duplicate flags).
 #
@@ -24,13 +24,13 @@ if [ -n "${RESUME:-}" ]; then
   set -- --resume "$RESUME" "$@"
 fi
 
-  # --resume output/rdlnet/rdlnet_20260422_154944.pt \
+  # --resume output/rdlnet/20260422_154944 \
   # --distill-checkpoint checkpoints/distill_stage1.pt \
 exec python train_rdlnet.py \
   --rwmd-root "output/data/train_resize" \
   --val-rwmd-root "output/data/test_resize" \
   --num-classes 2 \
-  --output output/rdlnet/rdlnet.pt \
+  --output output/rdlnet \
   --lite 20 \
   --epochs 500 \
   --batch-size 2 \

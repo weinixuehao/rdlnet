@@ -10,7 +10,7 @@ Example (manifest JSON)::
         --annotations data/annotations.json \\
         --image-root data/images \\
         --distill-checkpoint checkpoints/distill_stage1.pt \\
-        --output checkpoints/rdlnet.pt
+        --output output/rdlnet
 
 Example (RWMD preprocessed ``train_resize`` from ``data_preprocessing_rwdm_1``)::
 
@@ -18,7 +18,10 @@ Example (RWMD preprocessed ``train_resize`` from ``data_preprocessing_rwdm_1``):
         --rwmd-root path/to/out/train_resize \\
         --num-classes 2 \\
         --distill-checkpoint checkpoints/distill_stage1.pt \\
-        --output checkpoints/rdlnet.pt
+        --output output/rdlnet
+
+Each fresh run creates ``<output>/<YYYYMMDD_HHMMSS>/`` with ``rdlnet.pt`` (each epoch
+end), ``rdlnet_best.pt``, and ``tensorboard/``. Resume with ``--resume <that folder>``.
 
 See ``rdlnet.data.doc_json`` for the manifest format and :class:`RWMDLabelMeDataset`.
 """
@@ -26,13 +29,13 @@ See ``rdlnet.data.doc_json`` for the manifest format and :class:`RWMDLabelMeData
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -49,6 +52,11 @@ from rdlnet.model import RDLNet, RDLNetConfig
 from rdlnet.viz_rdlnet import train_compare_grid_u8
 
 LOSS_HISTORY_KEY = "train_rdlnet_loss_history"
+
+# Fixed names inside each run directory (--output/<timestamp>/).
+CKPT_MAIN = "rdlnet.pt"
+CKPT_BEST = "rdlnet_best.pt"
+TB_SUBDIR = "tensorboard"
 
 
 @dataclass
@@ -181,20 +189,19 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Stage-1 student_encoder weights (ignored if --resume loads a full model)",
     )
-    p.add_argument("--output", type=str, default="checkpoints/rdlnet.pt")
+    p.add_argument(
+        "--output",
+        type=str,
+        default="output/rdlnet",
+        help="Run root directory: new runs create <output>/<YYYYMMDD_HHMMSS>/ with ckpts + tensorboard/",
+    )
     p.add_argument(
         "--resume",
         type=str,
         default=None,
-        help="Resume full training state (model+optimizer+epoch) from a previous train_rdlnet checkpoint",
+        help="Resume from a previous run folder (same timestamp dir under --output), not a .pt path",
     )
     p.add_argument("--epochs", type=int, default=50, help="Additional epochs when resuming, or total epochs from scratch")
-    p.add_argument(
-        "--save-every-steps",
-        type=int,
-        default=0,
-        help="If >0, save a snapshot every N optimizer steps to *_latest.pt (Colab disconnect recovery)",
-    )
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument(
         "--grad-accum-steps",
@@ -264,7 +271,6 @@ def _quad_iou_from_points_norm(
 
     Points are expected to be ordered (TL/TR/BR/BL). Uses rasterization for robustness.
     """
-    import numpy as np
     import cv2
 
     def _to_poly(pts_flat: torch.Tensor) -> np.ndarray | None:
@@ -415,7 +421,19 @@ def main() -> None:
     start_epoch = 0
     best_val_ji = float("-inf")
     if args.resume:
-        ck = torch.load(args.resume, map_location=device)
+        run_dir = Path(args.resume).expanduser().resolve()
+        if run_dir.is_file():
+            raise SystemExit(
+                "--resume must be a run directory (e.g. output/rdlnet/20250424_153022), not a .pt file."
+            )
+        if not run_dir.is_dir():
+            raise SystemExit(f"--resume run directory does not exist: {run_dir}")
+        resume_ckpt = run_dir / CKPT_MAIN
+        if not resume_ckpt.is_file():
+            raise SystemExit(
+                f"No {CKPT_MAIN} in {run_dir}. Pass the timestamp run folder under --output."
+            )
+        ck = torch.load(resume_ckpt, map_location=device)
         model.load_state_dict(ck["model"])
         if "optimizer" in ck:
             opt.load_state_dict(ck["optimizer"])
@@ -432,29 +450,33 @@ def main() -> None:
             best_val_ji = float(ck["best_val_ji"])
         del ck
         print(
-            f"Resumed from {args.resume}: epoch={start_epoch}, optimizer_step={optimizer_step}"
+            f"Resumed from {resume_ckpt} (run {run_dir}): epoch={start_epoch}, optimizer_step={optimizer_step}"
         )
     elif args.distill_checkpoint:
         load_student_encoder_into_rdlnet_from_checkpoint(model, args.distill_checkpoint)
         print(f"Loaded student backbone from {args.distill_checkpoint}")
 
-    p_out = Path(args.output)
-    if args.resume:
-        out_path = p_out
-    else:
+    if not args.resume:
+        out_root = Path(args.output).expanduser().resolve()
+        if out_root.is_file():
+            raise SystemExit(
+                f"--output must be a directory, not a file ({out_root}). "
+                "Example: --output output/rdlnet"
+            )
         run_ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-        out_path = p_out.with_name(f"{p_out.stem}_{run_ts}{p_out.suffix}")
-    os.makedirs(out_path.parent or Path("."), exist_ok=True)
-    print(f"output checkpoint => {out_path}")
-    step_ckpt = out_path.with_name(out_path.stem + "_latest.pt")
-    best_ckpt_path = out_path.with_name(out_path.stem + "_best.pt")
+        run_dir = out_root / run_ts
+        run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"run directory => {run_dir}")
 
-    tb_logdir = out_path.parent / f"{out_path.stem}_tb"
+    out_path = run_dir / CKPT_MAIN
+    best_ckpt_path = run_dir / CKPT_BEST
+    print(f"output checkpoint => {out_path}")
+
+    tb_logdir = run_dir / TB_SUBDIR
     tb_logdir.mkdir(parents=True, exist_ok=True)
     print(f"tensorboard logdir => {tb_logdir}")
 
     end_epoch = start_epoch + args.epochs
-    import numpy as np
 
     with SummaryWriter(log_dir=str(tb_logdir)) as tb:
         for epoch in range(start_epoch, end_epoch):
@@ -497,8 +519,8 @@ def main() -> None:
                 do_step = (micro == accum) or (is_last_in_epoch and 0 < micro < accum)
                 if do_step:
                     if is_last_in_epoch and 0 < micro < accum:
-                        for p in model.parameters():
-                            g = p.grad
+                        for param in model.parameters():
+                            g = param.grad
                             if g is not None:
                                 g.mul_(accum / micro)
                     if args.grad_clip_norm > 0:
@@ -546,20 +568,6 @@ def main() -> None:
                             dataformats="CHW",
                         )
 
-                    if args.save_every_steps > 0 and optimizer_step % args.save_every_steps == 0:
-                        torch.save(
-                            {
-                                "model": model.state_dict(),
-                                "optimizer": opt.state_dict(),
-                                "scheduler": scheduler.state_dict(),
-                                "config": asdict(cfg),
-                                "epoch": epoch,
-                                "optimizer_step": optimizer_step,
-                                "note": "mid-epoch",
-                            },
-                            step_ckpt,
-                        )
-                        tqdm.write(f"Saved step checkpoint -> {step_ckpt}")
                     micro = 0
                 sums.update(loss, logs)
                 if _should_stop(bi, max_batches):
