@@ -7,7 +7,7 @@ Example::
     python train_distill.py \\
         --image-dir /path/to/unlabeled/images \\
         --teacher-checkpoint /path/to/sam_vit_h_4b8939.pth \\
-        --output checkpoints/distill_stage1.pt
+        --output output/distill
 
 Requires: SAM ViT-H weights and a folder of RGB images (any domain; natural images OK).
 """
@@ -15,7 +15,6 @@ Requires: SAM ViT-H weights and a folder of RGB images (any domain; natural imag
 from __future__ import annotations
 
 import argparse
-import os
 import random
 import sys
 import time
@@ -27,6 +26,7 @@ import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import MultiStepLR
 from tqdm.auto import tqdm
 
 _REPO = Path(__file__).resolve().parent
@@ -37,7 +37,6 @@ from rdlnet.data import CocoTrain2017BoxPrompts, DistillImageFolder
 from rdlnet.device import pick_device
 from rdlnet.distill import (
     DistillConfig,
-    LightSAMMultiplexDistillation,
     LightSAMMultiplexDistillationDecoderKD,
     build_image_encoder_student_table2,
     build_sam_mask_decoder,
@@ -51,88 +50,23 @@ from rdlnet.distill import (
 from rdlnet.sam_backbone import RDLNetSAMEncoder
 
 
-def print_runtime_context(
-    device: torch.device,
-    image_dir: str,
-    ds_len: int,
-    batch_size: int,
-    num_workers: int,
-    distill: nn.Module,
-) -> None:
-    """Where compute runs + loader settings (SSD/CPU decode vs GPU)."""
-    pin = device.type == "cuda"
-    print(f"image-dir: {image_dir}  |  dataset: {ds_len} images")
-    print(f"DataLoader: num_workers={num_workers}, pin_memory={pin}")
-    p0 = next(distill.parameters())
-    print(f"model params: device={p0.device}, dtype={p0.dtype}")
-    if device.type == "cuda":
-        idx = device.index if device.index is not None else 0
-        print(f"CUDA: {torch.cuda.get_device_name(idx)}")
-        cap = torch.cuda.get_device_properties(idx).total_memory / (1024**3)
-        print(f"CUDA VRAM: {cap:.1f} GiB total")
-        print(f"CUDA mem allocated (now): {torch.cuda.memory_allocated(idx) / 1e6:.0f} MB")
-    elif device.type == "mps":
-        print("MPS: Apple GPU (no nvidia-smi)")
-    else:
-        print("CPU: training will be much slower; check torch CUDA build + drivers if you expect a GPU.")
-
-
-def profile_one_batch(
-    loader: DataLoader,
-    distill: nn.Module,
+def _optimizer_step(
     opt: torch.optim.Optimizer,
-    device: torch.device,
-    pin_memory: bool,
-    use_amp: bool,
-) -> None:
+    scaler: GradScaler | None,
+) -> bool:
     """
-    Time: dataloader vs forward+backward (no optimizer.step — avoids changing weights).
-    Large 'dataloader' => disk decode / CPU / num_workers; large 'forward+backward' => GPU compute bound.
+    Returns True iff parameters were actually updated.
+    With AMP, GradScaler can skip optimizer.step() on overflow; we must not advance scheduler/step then.
     """
-    it = iter(loader)
-    t0 = time.perf_counter()
-    batch = next(it)
-    t1 = time.perf_counter()
-    if isinstance(batch, (tuple, list)) and len(batch) >= 2 and torch.is_tensor(batch[1]):
-        # COCO box prompts: (imgs, boxes, meta)
-        imgs, boxes = batch[0], batch[1]
-        imgs = imgs.to(device, non_blocking=pin_memory)
-        boxes = boxes.to(device, non_blocking=pin_memory)
-    else:
-        imgs, _paths = batch
-        imgs = imgs.to(device, non_blocking=pin_memory)
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    t2 = time.perf_counter()
-
-    distill.train()
-    opt.zero_grad(set_to_none=True)
-    with autocast("cuda", enabled=use_amp):
-        out = distill(imgs, boxes) if "boxes" in locals() else distill(imgs)
-    loss = out["loss"]
-    # One-step timing: no GradScaler (avoids mutating training scaler before the loop).
-    loss.backward()
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    elif device.type == "mps":
-        torch.mps.synchronize()
-    t3 = time.perf_counter()
-    opt.zero_grad(set_to_none=True)
-
-    dl_ms = (t1 - t0) * 1000
-    h2d_ms = (t2 - t1) * 1000
-    comp_ms = (t3 - t2) * 1000
-    total_ms = (t3 - t0) * 1000
-    print(
-        "[profile-batch] times (ms):  dataloader_next={:.1f}  h2d+sync={:.1f}  forward+backward+sync={:.1f}  (sum={:.1f})".format(
-            dl_ms, h2d_ms, comp_ms, total_ms
-        )
-    )
-    print(f"[profile-batch] imgs: device={imgs.device}, is_cuda={imgs.is_cuda}")
-    if dl_ms > comp_ms * 1.5:
-        print("[profile-batch] hint: dataloader >> compute — try faster disk, more num_workers, or smaller img_size.")
-    elif comp_ms > dl_ms * 2 and device.type == "cuda":
-        print("[profile-batch] hint: GPU compute dominates — expected for ViT-H teacher + 1024; batch_size>1 if VRAM allows.")
+    if scaler is None:
+        opt.step()
+        return True
+    scale_before = float(scaler.get_scale())
+    scaler.step(opt)
+    scaler.update()
+    scale_after = float(scaler.get_scale())
+    # If overflow happened, GradScaler reduces the scale and skips the step.
+    return scale_after >= scale_before
 
 
 def collate_distill(batch):
@@ -220,14 +154,14 @@ def parse_args() -> argparse.Namespace:
         default="output/distill",
         help="Output root directory. Each run creates a new timestamped subfolder under this directory.",
     )
-    p.add_argument("--resume", type=str, default=None, help="Resume from stage-1 checkpoint (weights + optimizer if present)")
-    p.add_argument("--epochs", type=int, default=1, help="Number of additional epochs to run in this session")
     p.add_argument(
-        "--save-every-steps",
-        type=int,
-        default=0,
-        help="If >0, also save a copy of the checkpoint every N steps (for Colab disconnects mid-epoch)",
+        "--resume",
+        type=str,
+        default=None,
+        help="Resume from stage-1 checkpoint.pt (weights + optimizer/scheduler/scaler if present). "
+        "Note: best.pt is not resumable.",
     )
+    p.add_argument("--epochs", type=int, default=1, help="Number of additional epochs to run in this session")
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument(
         "--grad-accum-steps",
@@ -242,11 +176,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=4.0)
     p.add_argument("--weight-kl", type=float, default=1.0)
     p.add_argument("--weight-md", type=float, default=1.0)
-    p.add_argument(
-        "--profile-batch",
-        action="store_true",
-        help="Print runtime (CPU/GPU/dataloader) and time one batch: disk+decode vs forward+backward",
-    )
     p.add_argument(
         "--seed",
         type=int,
@@ -267,13 +196,6 @@ def _make_run_dir(output_root: str | Path) -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     # Always create a unique folder per run (timestamp-based).
     return root / stamp
-
-
-def _resolve_in_run_dir(run_dir: Path, maybe_path: str | None, default_name: str) -> Path:
-    if not maybe_path:
-        return run_dir / default_name
-    p = Path(maybe_path)
-    return p if p.is_absolute() else (run_dir / p)
 
 
 def _make_tb_writer(run_dir: Path) -> SummaryWriter:
@@ -362,8 +284,10 @@ def main() -> None:
             teacher_checkpoint=args.teacher_checkpoint,
             cfg=cfg,
         ).to(device)
-        opt = torch.optim.AdamW(distill.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        trainable_params = [p for p in distill.parameters() if p.requires_grad]
+        opt = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     scaler: GradScaler | None = GradScaler("cuda") if use_amp else None
+    scheduler = MultiStepLR(opt, milestones=[40_000, 80_000, 120_000], gamma=0.1)
 
     start_epoch = 0
     global_step = 0
@@ -375,7 +299,15 @@ def main() -> None:
         load_distill_trainable_state_dict(distill, ck)
         if "optimizer" in ck:
             opt.load_state_dict(ck["optimizer"])
+        if "scheduler" in ck and isinstance(ck["scheduler"], dict):
+            scheduler.load_state_dict(ck["scheduler"])
         meta = ck.get("meta") or {}
+        step_unit = meta.get("step_unit")
+        if step_unit != "update":
+            raise SystemExit(
+                "This run uses update-step semantics (global_step == optimizer updates). "
+                f"Refusing to resume checkpoint with step_unit={step_unit!r}."
+            )
         start_epoch = int(meta.get("epochs_done", 0))
         global_step = int(ck.get("global_step", 0))
         print(f"Resumed from {args.resume}: epochs_done={start_epoch}, global_step={global_step}")
@@ -435,7 +367,6 @@ def main() -> None:
     run_dir = _make_run_dir(args.output)
     run_dir.mkdir(parents=True, exist_ok=True)
     out_path = run_dir / "checkpoint.pt"
-    step_ckpt = run_dir / "latest.pt"
     best_ckpt = run_dir / "best.pt"
     print(f"run_dir => {run_dir}")
     writer = _make_tb_writer(run_dir)
@@ -444,20 +375,6 @@ def main() -> None:
     print(
         f"grad_accum_steps={args.grad_accum_steps}  |  effective batch size (for optimizer) ≈ {eff_bs}"
     )
-
-    if args.profile_batch:
-        print_runtime_context(
-            device,
-            args.image_dir or f"COCO(train2017={args.coco_train_dir})",
-            len(ds),
-            args.batch_size,
-            args.num_workers,
-            distill,
-        )
-        profile_one_batch(
-            loader, distill, opt, device, pin_memory=device.type == "cuda", use_amp=use_amp
-        )
-        print("--- training starts ---")
 
     end_epoch = start_epoch + args.epochs
     try:
@@ -503,55 +420,30 @@ def main() -> None:
                 else:
                     (loss / accum).backward()
                 accum_count += 1
-                global_step += 1
                 epoch_loss_sum += float(loss.detach())
                 epoch_kl_sum += float(out["loss_kl"].detach())
                 epoch_md_sum += float(out["loss_md"].detach())
                 n_batches += 1
-                writer.add_scalar("train/kd_step", float(loss.detach()), global_step)
-                writer.add_scalar("train/kl_step", float(out["loss_kl"].detach()), global_step)
-                writer.add_scalar("train/md_step", float(out["loss_md"].detach()), global_step)
-                try:
-                    lr = float(opt.param_groups[0]["lr"])
-                    writer.add_scalar("train/lr", lr, global_step)
-                except Exception:
-                    pass
                 pbar.set_postfix(
-                    step=global_step,
+                    step=n_batches,
                     loss=f"{loss.item():.4f}",
                     kl=f"{out['loss_kl'].item():.4f}",
                     md=f"{out['loss_md'].item():.4f}",
                     accum=f"{accum_count}/{accum}",
                 )
                 if accum_count >= accum:
-                    if scaler is not None:
-                        scaler.step(opt)
-                        scaler.update()
-                    else:
-                        opt.step()
+                    did_step = _optimizer_step(opt, scaler)
+                    if did_step:
+                        scheduler.step()
                     opt.zero_grad(set_to_none=True)
                     accum_count = 0
-                if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
-                    meta = {
-                        "img_size": args.img_size,
-                        "backbone_dim": getattr(student_wrap, "embed_dim", None),
-                        "backbone_depth": getattr(student_wrap, "depth", None),
-                        "epochs_done": epoch,
-                        "grad_accum_steps": args.grad_accum_steps,
-                        "samples_per_epoch": args.samples_per_epoch,
-                        "seed": args.seed,
-                        "amp": use_amp,
-                        "dataset": "coco" if args.coco else "folder",
-                        "run_dir": str(run_dir),
-                        "note": "mid-epoch snapshot",
-                    }
-                    ckpt = distill_trainable_state_dict(distill, meta=meta)
-                    ckpt["optimizer"] = opt.state_dict()
-                    ckpt["global_step"] = global_step
-                    if scaler is not None:
-                        ckpt["scaler"] = scaler.state_dict()
-                    torch.save(ckpt, step_ckpt)
-                    print(f"Saved step checkpoint -> {step_ckpt}")
+                    if did_step:
+                        global_step += 1
+                        try:
+                            lr = float(opt.param_groups[0]["lr"])
+                            writer.add_scalar("train/lr", lr, global_step)
+                        except Exception:
+                            pass
 
         if accum_count > 0:
             scale = accum / accum_count
@@ -560,12 +452,17 @@ def main() -> None:
             for p in distill.parameters():
                 if p.grad is not None:
                     p.grad.mul_(scale)
-            if scaler is not None:
-                scaler.step(opt)
-                scaler.update()
-            else:
-                opt.step()
+            did_step = _optimizer_step(opt, scaler)
+            if did_step:
+                scheduler.step()
             opt.zero_grad(set_to_none=True)
+            if did_step:
+                global_step += 1
+                try:
+                    lr = float(opt.param_groups[0]["lr"])
+                    writer.add_scalar("train/lr", lr, global_step)
+                except Exception:
+                    pass
 
         if n_batches > 0:
             m_loss = epoch_loss_sum / n_batches
@@ -591,6 +488,7 @@ def main() -> None:
                     "dataset": "coco",
                     "run_dir": str(run_dir),
                     "note": "best by val KD",
+                    "step_unit": "update",
                     "val_kd": float(val_kd),
                     "val_kl": float(val_kl),
                     "val_md": float(val_md),
@@ -611,9 +509,11 @@ def main() -> None:
             "amp": use_amp,
             "dataset": "coco" if args.coco else "folder",
             "run_dir": str(run_dir),
+            "step_unit": "update",
         }
         ckpt = distill_trainable_state_dict(distill, meta=meta)
         ckpt["optimizer"] = opt.state_dict()
+        ckpt["scheduler"] = scheduler.state_dict()
         ckpt["global_step"] = global_step
         ckpt["best_val_kd"] = best_val_kd
         if scaler is not None:
