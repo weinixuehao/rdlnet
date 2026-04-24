@@ -8,7 +8,8 @@ RWMD dataset preprocessing (LabelMe → training packs).
 **Core steps**
 
 1. :func:`genarate_label_from_ori` — per image + sidecar ``.json``: numeric polygon labels use
-   **max digit = foreground**, smaller digits = background (union → contour instances); optional
+   **max digit = foreground**; smaller digits = background, **one instance per digit** (all polygons
+   with the same label are unioned, including disconnected pieces under occlusion). Optional
    ``foreground_doc`` quadrilateral → ``label_points.json`` keys.
 2. :func:`split_data` — shuffle split ``img``/``mask``/``label_points.json``.
 3. :func:`resize_customdata` — scale image, mask, and quad points; write ``label_points_resize.json``.
@@ -334,11 +335,12 @@ def genarate_label_from_ori(src_dir, dst_dir):
     ``img/*.png``, ``mask/*.png``, and ``label_points.json`` keys matching those basenames.
     Output names encode relative paths (``subdir__file.png``) so nested files do not overwrite.
 
-    **Digit polygon labels:** only **foreground vs background** (binary). Let ``M`` be the
-    **maximum** digit among numeric shapes (ignoring ``foreground_doc``). Polygons with label
-    ``M`` are **foreground document**; every polygon with a smaller digit is **background**
-    (unioned, then split into instances by contours). If only ``"1"`` appears, ``M == 1`` and
-    those polygons are **foreground**; there is no separate background digit layer.
+    **Digit polygon labels:** Let ``M`` be the **maximum** digit among numeric shapes (ignoring
+    ``foreground_doc``). Polygons with label ``M`` are **foreground**; each smaller digit ``d < M`` is
+    **one background instance**: all polygons labeled ``d`` are **unioned** (occlusion may split them
+    into several polygons; they still share one instance id). Background instance ids are assigned in
+    ascending order of ``d``, then the foreground (``M``) gets the last id. If only ``"1"`` appears,
+    ``M == 1`` and those polygons are **foreground**; there is no separate background digit layer.
 
     Instance ids ``1..K`` in ``mask`` are scaled to spread grayscale ``1..255`` (``K==1`` → 255)
     so PNGs are visible; order is preserved for downstream loaders that use ``max(unique)``.
@@ -373,8 +375,8 @@ def genarate_label_from_ori(src_dir, dst_dir):
             if img_bgr is None:
                 continue
 
-            bg_polys: list[np.ndarray] = []
             fg_polys: list[np.ndarray] = []
+            bg_by_label: dict[int, list[np.ndarray]] = {}
             foreground_quad: Optional[np.ndarray] = None
             digit_polys: list[tuple[int, np.ndarray]] = []
             for l in label["shapes"]:
@@ -397,32 +399,26 @@ def genarate_label_from_ori(src_dir, dst_dir):
                     if lab_i == max_lab:
                         fg_polys.append(poly)
                     else:
-                        bg_polys.append(poly)
+                        bg_by_label.setdefault(lab_i, []).append(poly)
 
-            if not fg_polys and not bg_polys:
+            if not fg_polys and not bg_by_label:
                 continue
 
             h, w = int(img_bgr.shape[0]), int(img_bgr.shape[1])
-            # Background: union all bg polys into one mask, then split into connected components (docs).
-            bg_union = np.zeros((h, w), dtype=np.uint8)
-            for poly in bg_polys:
-                if poly.size == 0:
-                    continue
-                cv2.fillPoly(bg_union, [np.asarray(poly, dtype=np.int32)], 1)
-
-            contours, _ = cv2.findContours(bg_union, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            bg_instances: list[np.ndarray] = []
-            for c in contours:
-                hull = cv2.convexHull(c)
-                if cv2.contourArea(hull) < 100:
-                    continue
-                bg_instances.append(c)
-
+            # Background: one instance per digit d < M — union all polygons with the same label
+            # (disconnected under occlusion = same instance). Skip tiny noise (<100 px on union).
             mask_new = np.zeros((h, w), dtype=np.uint8)
             inst_id = 0
-            for c in sorted(bg_instances, key=lambda cc: cv2.contourArea(cc), reverse=True):
+            for lab_d in sorted(bg_by_label.keys()):
+                layer = np.zeros((h, w), dtype=np.uint8)
+                for poly in bg_by_label[lab_d]:
+                    if poly.size == 0:
+                        continue
+                    cv2.fillPoly(layer, [np.asarray(poly, dtype=np.int32)], 1)
+                if int(np.count_nonzero(layer)) < 100:
+                    continue
                 inst_id += 1
-                cv2.fillPoly(mask_new, [np.asarray(c, dtype=np.int32)], inst_id)
+                mask_new[layer > 0] = inst_id
 
             # Foreground: always the last / max instance id.
             if fg_polys:

@@ -211,9 +211,9 @@ class RWMDLabelMeDataset(Dataset):
     - ``mask/*.png`` — uint8 instance ids (largest id = top sheet).
     - ``label_points_resize.json`` — ``foreground_doc`` polygon per basename for quad targets.
 
-    LabelMe digits are fg/bg only: **max digit** = foreground document, smaller digits = background
-    (see ``genarate_label_from_ori``). **Classes:** top sheet (max instance id in mask) → 0;
-    others → 1 (use ``num_classes=2``).
+    LabelMe digits: **max digit** = foreground; each smaller digit is one **background** instance, with
+    all polygons of the same digit unioned (see ``genarate_label_from_ori``). **Classes:** top sheet
+    (largest instance id in mask) → 0; others → 1 (use ``num_classes=2``).
     """
 
     def __init__(
