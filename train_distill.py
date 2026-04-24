@@ -20,25 +20,33 @@ import random
 import sys
 import time
 from pathlib import Path
+from datetime import datetime
 
 import torch
 import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
 _REPO = Path(__file__).resolve().parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from rdlnet.data import DistillImageFolder
+from rdlnet.data import CocoTrain2017BoxPrompts, DistillImageFolder
 from rdlnet.device import pick_device
 from rdlnet.distill import (
     DistillConfig,
     LightSAMMultiplexDistillation,
+    LightSAMMultiplexDistillationDecoderKD,
+    build_image_encoder_student_table2,
+    build_sam_mask_decoder,
+    build_sam_prompt_encoder,
+    build_teacher_image_encoder_vit_h_with_neck,
     create_distillation_setup,
     distill_trainable_state_dict,
     load_distill_trainable_state_dict,
+    load_sam_submodules_from_checkpoint,
 )
 from rdlnet.sam_backbone import RDLNetSAMEncoder
 
@@ -83,9 +91,16 @@ def profile_one_batch(
     """
     it = iter(loader)
     t0 = time.perf_counter()
-    imgs, _paths = next(it)
+    batch = next(it)
     t1 = time.perf_counter()
-    imgs = imgs.to(device, non_blocking=pin_memory)
+    if isinstance(batch, (tuple, list)) and len(batch) >= 2 and torch.is_tensor(batch[1]):
+        # COCO box prompts: (imgs, boxes, meta)
+        imgs, boxes = batch[0], batch[1]
+        imgs = imgs.to(device, non_blocking=pin_memory)
+        boxes = boxes.to(device, non_blocking=pin_memory)
+    else:
+        imgs, _paths = batch
+        imgs = imgs.to(device, non_blocking=pin_memory)
     if device.type == "cuda":
         torch.cuda.synchronize()
     t2 = time.perf_counter()
@@ -93,7 +108,7 @@ def profile_one_batch(
     distill.train()
     opt.zero_grad(set_to_none=True)
     with autocast("cuda", enabled=use_amp):
-        out = distill(imgs)
+        out = distill(imgs, boxes) if "boxes" in locals() else distill(imgs)
     loss = out["loss"]
     # One-step timing: no GradScaler (avoids mutating training scaler before the loop).
     loss.backward()
@@ -126,6 +141,40 @@ def collate_distill(batch):
     return imgs, paths
 
 
+def collate_distill_coco_box(batch):
+    imgs = torch.stack([b[0] for b in batch], dim=0)
+    boxes = torch.stack([b[1] for b in batch], dim=0)  # [B,4]
+    metas = [b[2] for b in batch]
+    return imgs, boxes, metas
+
+
+@torch.no_grad()
+def validate_one_epoch_coco(
+    loader: DataLoader,
+    distill: nn.Module,
+    device: torch.device,
+    *,
+    use_amp: bool,
+) -> tuple[float, float, float]:
+    distill.eval()
+    loss_sum = 0.0
+    kl_sum = 0.0
+    md_sum = 0.0
+    n = 0
+    for imgs, boxes, _meta in loader:
+        imgs = imgs.to(device)
+        boxes = boxes.to(device)
+        with autocast("cuda", enabled=use_amp):
+            out = distill(imgs, boxes)
+        loss_sum += float(out["loss"].detach())
+        kl_sum += float(out["loss_kl"].detach())
+        md_sum += float(out["loss_md"].detach())
+        n += 1
+    if n == 0:
+        return float("inf"), float("inf"), float("inf")
+    return loss_sum / n, kl_sum / n, md_sum / n
+
+
 def make_distill_loader(
     ds: DistillImageFolder,
     batch_size: int,
@@ -148,73 +197,15 @@ def make_distill_loader(
     )
 
 
-LOSS_PLOT_HISTORY_KEY = "loss_plot_history"
-
-
-def load_loss_plot_history_from_ck(ck: dict) -> tuple[list[int], list[float], list[float], list[float]]:
-    """Restore per-epoch loss lists saved in a stage-1 checkpoint (for PNG continuity on --resume)."""
-    h = ck.get(LOSS_PLOT_HISTORY_KEY)
-    if not isinstance(h, dict):
-        return [], [], [], []
-    try:
-        ep = [int(x) for x in h["epochs"]]
-        lo = [float(x) for x in h["loss"]]
-        kl = [float(x) for x in h["loss_kl"]]
-        md = [float(x) for x in h["loss_md"]]
-    except (KeyError, TypeError, ValueError):
-        return [], [], [], []
-    n = min(len(ep), len(lo), len(kl), len(md))
-    if n == 0:
-        return [], [], [], []
-    return ep[:n], lo[:n], kl[:n], md[:n]
-
-
-def pack_loss_plot_history(
-    epochs: list[int],
-    losses: list[float],
-    kls: list[float],
-    mds: list[float],
-) -> dict[str, object]:
-    return {
-        "epochs": list(epochs),
-        "loss": list(losses),
-        "loss_kl": list(kls),
-        "loss_md": list(mds),
-    }
-
-
-def save_loss_plot_png(
-    path: Path,
-    epochs: list[int],
-    losses: list[float],
-    kls: list[float],
-    mds: list[float],
-) -> None:
-    """Save loss curves as a PNG. Intended to run after every epoch (file is overwritten)."""
-    if not epochs:
-        return
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.plot(epochs, losses, label="loss")
-    ax.plot(epochs, kls, label="loss_kl")
-    ax.plot(epochs, mds, label="loss_md")
-    ax.set_xlabel("epoch")
-    ax.set_ylabel("mean (per batch, train)")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Stage 1: distill Light-SAM student from SAM ViT-H")
-    p.add_argument("--image-dir", type=str, required=True, help="Directory of RGB images (recursive)")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--image-dir", type=str, default=None, help="Directory of RGB images (recursive) [encoder-only distill]")
+    src.add_argument("--coco", action="store_true", help="Use extracted COCO train2017/ + instances json (box prompts + decoder KD)")
+    p.add_argument("--coco-train-dir", type=str, default="dataset/coco/train2017", help="Extracted COCO train2017/ directory")
+    p.add_argument("--coco-instances-json", type=str, default="dataset/coco/annotations/instances_train2017.json")
+    p.add_argument("--coco-val-dir", type=str, default="dataset/coco/val2017", help="Extracted COCO val2017/ directory")
+    p.add_argument("--coco-val-instances-json", type=str, default="dataset/coco/annotations/instances_val2017.json")
     p.add_argument(
         "--samples-per-epoch",
         type=int,
@@ -223,7 +214,12 @@ def parse_args() -> argparse.Namespace:
         "Omits to use every image once per epoch (full pass).",
     )
     p.add_argument("--teacher-checkpoint", type=str, required=True, help="sam_vit_h_4b8939.pth")
-    p.add_argument("--output", type=str, default="checkpoints/distill_stage1.pt")
+    p.add_argument(
+        "--output",
+        type=str,
+        default="output/distill",
+        help="Output root directory. Each run creates a new timestamped subfolder under this directory.",
+    )
     p.add_argument("--resume", type=str, default=None, help="Resume from stage-1 checkpoint (weights + optimizer if present)")
     p.add_argument("--epochs", type=int, default=1, help="Number of additional epochs to run in this session")
     p.add_argument(
@@ -247,12 +243,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-kl", type=float, default=1.0)
     p.add_argument("--weight-md", type=float, default=1.0)
     p.add_argument(
-        "--loss-plot",
-        type=str,
-        default=None,
-        help="PNG path for loss curves (default: next to --output, e.g. distill_stage1_loss.png)",
-    )
-    p.add_argument(
         "--profile-batch",
         action="store_true",
         help="Print runtime (CPU/GPU/dataloader) and time one batch: disk+decode vs forward+backward",
@@ -269,6 +259,27 @@ def parse_args() -> argparse.Namespace:
         help="CUDA mixed precision (fp16 forward under autocast, fp32 master weights + GradScaler). Ignored on non-CUDA.",
     )
     return p.parse_args()
+
+
+def _make_run_dir(output_root: str | Path) -> Path:
+    root = Path(output_root)
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Always create a unique folder per run (timestamp-based).
+    return root / stamp
+
+
+def _resolve_in_run_dir(run_dir: Path, maybe_path: str | None, default_name: str) -> Path:
+    if not maybe_path:
+        return run_dir / default_name
+    p = Path(maybe_path)
+    return p if p.is_absolute() else (run_dir / p)
+
+
+def _make_tb_writer(run_dir: Path) -> SummaryWriter:
+    tb_dir = run_dir / "tb"
+    tb_dir.mkdir(parents=True, exist_ok=True)
+    return SummaryWriter(log_dir=str(tb_dir))
 
 
 def main() -> None:
@@ -291,40 +302,72 @@ def main() -> None:
         print(f"         ({torch.cuda.get_device_name(0)})")
     print(f"AMP (fp16 autocast): {'on' if use_amp else 'off'}")
 
-    ds = DistillImageFolder(
-        args.image_dir,
-        img_size=args.img_size,
-        samples_per_epoch=args.samples_per_epoch,
-        subset_seed=args.seed,
-    )
-    if args.samples_per_epoch is not None:
-        print(
-            f"samples_per_epoch={args.samples_per_epoch}  |  pool_size={ds.pool_size}  |  subset_seed={args.seed} "
-            "(deterministic subset per global epoch index; not a full pass per epoch)"
-        )
-
-    student_wrap = RDLNetSAMEncoder(img_size=args.img_size)
     cfg = DistillConfig(
         temperature=args.temperature,
         weight_kl=args.weight_kl,
         weight_md=args.weight_md,
         teacher_checkpoint=args.teacher_checkpoint,
     )
-    distill: LightSAMMultiplexDistillation = create_distillation_setup(
-        student_wrap.encoder,
-        teacher_checkpoint=args.teacher_checkpoint,
-        cfg=cfg,
-    ).to(device)
 
-    opt = torch.optim.AdamW(distill.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.coco:
+        ds = CocoTrain2017BoxPrompts(
+            images=args.coco_train_dir,
+            instances_json=args.coco_instances_json,
+            img_size=args.img_size,
+            seed=args.seed,
+            instances_per_image=1,
+        )
+        student_image_encoder = build_image_encoder_student_table2(img_size=args.img_size)
+        teacher_image_encoder = build_teacher_image_encoder_vit_h_with_neck()
+        teacher_prompt = build_sam_prompt_encoder(img_size=args.img_size)
+        student_prompt = build_sam_prompt_encoder(img_size=args.img_size)
+        teacher_mask = build_sam_mask_decoder()
+        student_mask = build_sam_mask_decoder()
+        load_sam_submodules_from_checkpoint(
+            teacher_image_encoder=teacher_image_encoder,
+            teacher_prompt_encoder=teacher_prompt,
+            teacher_mask_decoder=teacher_mask,
+            student_prompt_encoder=student_prompt,
+            student_mask_decoder=student_mask,
+            checkpoint_path=args.teacher_checkpoint,
+            strict=False,
+        )
+        distill = LightSAMMultiplexDistillationDecoderKD(
+            teacher_image_encoder=teacher_image_encoder,
+            student_image_encoder=student_image_encoder,
+            teacher_prompt_encoder=teacher_prompt,
+            student_prompt_encoder=student_prompt,
+            teacher_mask_decoder=teacher_mask,
+            student_mask_decoder=student_mask,
+            cfg=cfg,
+        ).to(device)
+        trainable_params = [p for p in distill.parameters() if p.requires_grad]
+        opt = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+        student_wrap = None
+    else:
+        ds = DistillImageFolder(
+            args.image_dir,
+            img_size=args.img_size,
+            samples_per_epoch=args.samples_per_epoch,
+            subset_seed=args.seed,
+        )
+        if args.samples_per_epoch is not None:
+            print(
+                f"samples_per_epoch={args.samples_per_epoch}  |  pool_size={ds.pool_size}  |  subset_seed={args.seed} "
+                "(deterministic subset per global epoch index; not a full pass per epoch)"
+            )
+        student_wrap = RDLNetSAMEncoder(img_size=args.img_size)
+        distill = create_distillation_setup(
+            student_wrap.encoder,
+            teacher_checkpoint=args.teacher_checkpoint,
+            cfg=cfg,
+        ).to(device)
+        opt = torch.optim.AdamW(distill.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler: GradScaler | None = GradScaler("cuda") if use_amp else None
 
     start_epoch = 0
     global_step = 0
-    hist_ep: list[int] = []
-    hist_loss: list[float] = []
-    hist_kl: list[float] = []
-    hist_md: list[float] = []
+    best_val_kd = float("inf")
     if args.resume:
         ck = torch.load(args.resume, map_location=device)
         if not isinstance(ck, dict):
@@ -335,20 +378,7 @@ def main() -> None:
         meta = ck.get("meta") or {}
         start_epoch = int(meta.get("epochs_done", 0))
         global_step = int(ck.get("global_step", 0))
-        hist_ep, hist_loss, hist_kl, hist_md = load_loss_plot_history_from_ck(ck)
         print(f"Resumed from {args.resume}: epochs_done={start_epoch}, global_step={global_step}")
-        if hist_ep:
-            print(f"loss plot history: {len(hist_ep)} points restored (full curve redrawn each epoch)")
-            if len(hist_ep) != start_epoch:
-                print(
-                    f"Warning: loss_plot_history length ({len(hist_ep)}) != epochs_done ({start_epoch}); "
-                    "curve may be inconsistent (old ckpt or hand-edited file)."
-                )
-            elif hist_ep[-1] != start_epoch:
-                print(
-                    f"Warning: last loss epoch id ({hist_ep[-1]}) != epochs_done ({start_epoch}); "
-                    "plot x-axis may be wrong."
-                )
         ck_seed = (ck.get("meta") or {}).get("seed")
         if ck_seed is not None and int(ck_seed) != args.seed:
             print(
@@ -363,112 +393,165 @@ def main() -> None:
             )
         if scaler is not None and isinstance(ck.get("scaler"), dict):
             scaler.load_state_dict(ck["scaler"])
+        if isinstance(ck.get("best_val_kd"), (int, float)):
+            best_val_kd = float(ck["best_val_kd"])
 
-    if args.samples_per_epoch is not None:
+    if args.samples_per_epoch is not None and not args.coco:
         ds.resample_epoch(start_epoch)
-    loader = make_distill_loader(
-        ds,
-        args.batch_size,
-        args.num_workers,
-        device,
-        seed=args.seed,
-        epoch_index=start_epoch,
-    )
+    if args.coco:
+        loader = DataLoader(
+            ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            collate_fn=collate_distill_coco_box,
+            pin_memory=device.type == "cuda",
+        )
+        val_ds = CocoTrain2017BoxPrompts(
+            images=args.coco_val_dir,
+            instances_json=args.coco_val_instances_json,
+            img_size=args.img_size,
+            seed=args.seed + 1337,
+            instances_per_image=1,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=collate_distill_coco_box,
+            pin_memory=device.type == "cuda",
+        )
+    else:
+        loader = make_distill_loader(
+            ds,
+            args.batch_size,
+            args.num_workers,
+            device,
+            seed=args.seed,
+            epoch_index=start_epoch,
+        )
 
-    os.makedirs(Path(args.output).parent or ".", exist_ok=True)
-    out_path = Path(args.output)
-    step_ckpt = out_path.with_name(out_path.stem + "_latest.pt")
-    loss_plot_path = Path(args.loss_plot) if args.loss_plot else out_path.with_name(out_path.stem + "_loss.png")
-    print(f"loss plot (PNG) => {loss_plot_path}")
+    run_dir = _make_run_dir(args.output)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    out_path = run_dir / "checkpoint.pt"
+    step_ckpt = run_dir / "latest.pt"
+    best_ckpt = run_dir / "best.pt"
+    print(f"run_dir => {run_dir}")
+    writer = _make_tb_writer(run_dir)
+    print(f"tensorboard logdir => {run_dir / 'tb'}")
     eff_bs = args.batch_size * args.grad_accum_steps
     print(
         f"grad_accum_steps={args.grad_accum_steps}  |  effective batch size (for optimizer) ≈ {eff_bs}"
     )
 
     if args.profile_batch:
-        print_runtime_context(device, args.image_dir, len(ds), args.batch_size, args.num_workers, distill)
+        print_runtime_context(
+            device,
+            args.image_dir or f"COCO(train2017={args.coco_train_dir})",
+            len(ds),
+            args.batch_size,
+            args.num_workers,
+            distill,
+        )
         profile_one_batch(
             loader, distill, opt, device, pin_memory=device.type == "cuda", use_amp=use_amp
         )
         print("--- training starts ---")
 
     end_epoch = start_epoch + args.epochs
-    for epoch in range(start_epoch, end_epoch):
-        # First epoch of this session uses ds/loader from resample_epoch(start_epoch) before the loop.
-        # Resampling here every epoch would discard that subset and break --profile-batch vs epoch 0 alignment.
-        if args.samples_per_epoch is not None and epoch > start_epoch:
-            ds.resample_epoch(epoch)
-            loader = make_distill_loader(
-                ds,
-                args.batch_size,
-                args.num_workers,
-                device,
-                seed=args.seed,
-                epoch_index=epoch,
+    try:
+        for epoch in range(start_epoch, end_epoch):
+            # First epoch of this session uses ds/loader from resample_epoch(start_epoch) before the loop.
+            # Resampling here every epoch would discard that subset and break --profile-batch vs epoch 0 alignment.
+            if args.samples_per_epoch is not None and (not args.coco) and epoch > start_epoch:
+                ds.resample_epoch(epoch)
+                loader = make_distill_loader(
+                    ds,
+                    args.batch_size,
+                    args.num_workers,
+                    device,
+                    seed=args.seed,
+                    epoch_index=epoch,
+                )
+            distill.train()
+            pbar = tqdm(
+                loader,
+                desc=f"epoch {epoch + 1}/{end_epoch}",
+                dynamic_ncols=True,
             )
-        distill.train()
-        pbar = tqdm(
-            loader,
-            desc=f"epoch {epoch + 1}/{end_epoch}",
-            dynamic_ncols=True,
-        )
-        epoch_loss_sum = 0.0
-        epoch_kl_sum = 0.0
-        epoch_md_sum = 0.0
-        n_batches = 0
-        accum = args.grad_accum_steps
-        accum_count = 0
-        opt.zero_grad(set_to_none=True)
-        for imgs, _paths in pbar:
-            imgs = imgs.to(device)
-            with autocast("cuda", enabled=use_amp):
-                out = distill(imgs)
-            loss = out["loss"]
-            if scaler is not None:
-                scaler.scale(loss / accum).backward()
-            else:
-                (loss / accum).backward()
-            accum_count += 1
-            global_step += 1
-            epoch_loss_sum += float(loss.detach())
-            epoch_kl_sum += float(out["loss_kl"].detach())
-            epoch_md_sum += float(out["loss_md"].detach())
-            n_batches += 1
-            pbar.set_postfix(
-                step=global_step,
-                loss=f"{loss.item():.4f}",
-                kl=f"{out['loss_kl'].item():.4f}",
-                md=f"{out['loss_md'].item():.4f}",
-                accum=f"{accum_count}/{accum}",
-            )
-            if accum_count >= accum:
-                if scaler is not None:
-                    scaler.step(opt)
-                    scaler.update()
+            epoch_loss_sum = 0.0
+            epoch_kl_sum = 0.0
+            epoch_md_sum = 0.0
+            n_batches = 0
+            accum = args.grad_accum_steps
+            accum_count = 0
+            opt.zero_grad(set_to_none=True)
+            for batch in pbar:
+                if args.coco:
+                    imgs, boxes, _meta = batch
+                    imgs = imgs.to(device)
+                    boxes = boxes.to(device)
                 else:
-                    opt.step()
-                opt.zero_grad(set_to_none=True)
-                accum_count = 0
-            if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
-                meta = {
-                    "img_size": args.img_size,
-                    "backbone_dim": student_wrap.embed_dim,
-                    "backbone_depth": student_wrap.depth,
-                    "epochs_done": epoch,
-                    "grad_accum_steps": args.grad_accum_steps,
-                    "samples_per_epoch": args.samples_per_epoch,
-                    "seed": args.seed,
-                    "amp": use_amp,
-                    "note": "mid-epoch snapshot",
-                }
-                ckpt = distill_trainable_state_dict(distill, meta=meta)
-                ckpt["optimizer"] = opt.state_dict()
-                ckpt["global_step"] = global_step
-                ckpt[LOSS_PLOT_HISTORY_KEY] = pack_loss_plot_history(hist_ep, hist_loss, hist_kl, hist_md)
+                    imgs, _paths = batch
+                    imgs = imgs.to(device)
+                with autocast("cuda", enabled=use_amp):
+                    out = distill(imgs, boxes) if args.coco else distill(imgs)
+                loss = out["loss"]
                 if scaler is not None:
-                    ckpt["scaler"] = scaler.state_dict()
-                torch.save(ckpt, step_ckpt)
-                print(f"Saved step checkpoint -> {step_ckpt}")
+                    scaler.scale(loss / accum).backward()
+                else:
+                    (loss / accum).backward()
+                accum_count += 1
+                global_step += 1
+                epoch_loss_sum += float(loss.detach())
+                epoch_kl_sum += float(out["loss_kl"].detach())
+                epoch_md_sum += float(out["loss_md"].detach())
+                n_batches += 1
+                writer.add_scalar("train/kd_step", float(loss.detach()), global_step)
+                writer.add_scalar("train/kl_step", float(out["loss_kl"].detach()), global_step)
+                writer.add_scalar("train/md_step", float(out["loss_md"].detach()), global_step)
+                try:
+                    lr = float(opt.param_groups[0]["lr"])
+                    writer.add_scalar("train/lr", lr, global_step)
+                except Exception:
+                    pass
+                pbar.set_postfix(
+                    step=global_step,
+                    loss=f"{loss.item():.4f}",
+                    kl=f"{out['loss_kl'].item():.4f}",
+                    md=f"{out['loss_md'].item():.4f}",
+                    accum=f"{accum_count}/{accum}",
+                )
+                if accum_count >= accum:
+                    if scaler is not None:
+                        scaler.step(opt)
+                        scaler.update()
+                    else:
+                        opt.step()
+                    opt.zero_grad(set_to_none=True)
+                    accum_count = 0
+                if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
+                    meta = {
+                        "img_size": args.img_size,
+                        "backbone_dim": getattr(student_wrap, "embed_dim", None),
+                        "backbone_depth": getattr(student_wrap, "depth", None),
+                        "epochs_done": epoch,
+                        "grad_accum_steps": args.grad_accum_steps,
+                        "samples_per_epoch": args.samples_per_epoch,
+                        "seed": args.seed,
+                        "amp": use_amp,
+                        "dataset": "coco" if args.coco else "folder",
+                        "run_dir": str(run_dir),
+                        "note": "mid-epoch snapshot",
+                    }
+                    ckpt = distill_trainable_state_dict(distill, meta=meta)
+                    ckpt["optimizer"] = opt.state_dict()
+                    ckpt["global_step"] = global_step
+                    if scaler is not None:
+                        ckpt["scaler"] = scaler.state_dict()
+                    torch.save(ckpt, step_ckpt)
+                    print(f"Saved step checkpoint -> {step_ckpt}")
 
         if accum_count > 0:
             scale = accum / accum_count
@@ -488,32 +571,58 @@ def main() -> None:
             m_loss = epoch_loss_sum / n_batches
             m_kl = epoch_kl_sum / n_batches
             m_md = epoch_md_sum / n_batches
-            hist_ep.append(epoch + 1)
-            hist_loss.append(m_loss)
-            hist_kl.append(m_kl)
-            hist_md.append(m_md)
-            # One PNG update per finished epoch (not only when all epochs end).
-            save_loss_plot_png(loss_plot_path, hist_ep, hist_loss, hist_kl, hist_md)
-            print(f"Updated loss plot -> {loss_plot_path}")
+            writer.add_scalar("train/kd_epoch", m_loss, epoch + 1)
+            writer.add_scalar("train/kl_epoch", m_kl, epoch + 1)
+            writer.add_scalar("train/md_epoch", m_md, epoch + 1)
+
+        if args.coco:
+            val_kd, val_kl, val_md = validate_one_epoch_coco(val_loader, distill, device, use_amp=use_amp)
+            print(f"[val] kd={val_kd:.4f}  kl={val_kl:.4f}  md={val_md:.4f}  (best_kd={best_val_kd:.4f})")
+            writer.add_scalar("val/kd_epoch", val_kd, epoch + 1)
+            writer.add_scalar("val/kl_epoch", val_kl, epoch + 1)
+            writer.add_scalar("val/md_epoch", val_md, epoch + 1)
+            if val_kd < best_val_kd:
+                best_val_kd = val_kd
+                meta_best = {
+                    "img_size": args.img_size,
+                    "epochs_done": epoch + 1,
+                    "seed": args.seed,
+                    "amp": use_amp,
+                    "dataset": "coco",
+                    "run_dir": str(run_dir),
+                    "note": "best by val KD",
+                    "val_kd": float(val_kd),
+                    "val_kl": float(val_kl),
+                    "val_md": float(val_md),
+                }
+                best_state = distill_trainable_state_dict(distill, meta=meta_best)
+                best_state["best_val_kd"] = best_val_kd
+                torch.save(best_state, best_ckpt)
+                print(f"Saved best checkpoint -> {best_ckpt}")
 
         meta = {
             "img_size": args.img_size,
-            "backbone_dim": student_wrap.embed_dim,
-            "backbone_depth": student_wrap.depth,
+            "backbone_dim": getattr(student_wrap, "embed_dim", None),
+            "backbone_depth": getattr(student_wrap, "depth", None),
             "epochs_done": epoch + 1,
             "grad_accum_steps": args.grad_accum_steps,
             "samples_per_epoch": args.samples_per_epoch,
             "seed": args.seed,
             "amp": use_amp,
+            "dataset": "coco" if args.coco else "folder",
+            "run_dir": str(run_dir),
         }
         ckpt = distill_trainable_state_dict(distill, meta=meta)
         ckpt["optimizer"] = opt.state_dict()
         ckpt["global_step"] = global_step
-        ckpt[LOSS_PLOT_HISTORY_KEY] = pack_loss_plot_history(hist_ep, hist_loss, hist_kl, hist_md)
+        ckpt["best_val_kd"] = best_val_kd
         if scaler is not None:
             ckpt["scaler"] = scaler.state_dict()
-        torch.save(ckpt, args.output)
-        print(f"Saved checkpoint to {args.output}")
+        torch.save(ckpt, out_path)
+        print(f"Saved checkpoint to {out_path}")
+    finally:
+        writer.flush()
+        writer.close()
 
 
 if __name__ == "__main__":

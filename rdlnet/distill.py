@@ -23,7 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .sam_backbone import ImageEncoderViT
+from .sam_backbone import ImageEncoderViT, MaskDecoder, PromptEncoder, TwoWayTransformer
 
 # -----------------------------------------------------------------------------
 # Forward helpers (ImageEncoderViT with or without neck — neck unused here)
@@ -231,20 +231,274 @@ class LightSAMMultiplexDistillation(nn.Module):
         }
 
 
-def distill_trainable_state_dict(distill_mod: LightSAMMultiplexDistillation, meta: Optional[Dict[str, object]] = None) -> Dict[str, object]:
-    """Checkpoint for stage 1: student encoder + KL head (teacher not saved)."""
-    out: Dict[str, object] = {
-        "student_encoder": distill_mod.student.state_dict(),
-        "kl_proj": distill_mod.kl_proj.state_dict(),
-    }
+# -----------------------------------------------------------------------------
+# Decoder-output KD variant (box prompts, frozen prompt/mask decoders)
+# -----------------------------------------------------------------------------
+
+
+def build_sam_prompt_encoder(*, img_size: int = 1024, patch_size: int = 16, prompt_embed_dim: int = 256) -> nn.Module:
+    if PromptEncoder is None:
+        raise ImportError("segment_anything PromptEncoder unavailable; check sam_backbone.")
+    image_embedding_size = img_size // patch_size
+    return PromptEncoder(
+        embed_dim=prompt_embed_dim,
+        image_embedding_size=(image_embedding_size, image_embedding_size),
+        input_image_size=(img_size, img_size),
+        mask_in_chans=16,
+    )
+
+
+def build_sam_mask_decoder(*, prompt_embed_dim: int = 256) -> nn.Module:
+    if MaskDecoder is None or TwoWayTransformer is None:
+        raise ImportError("segment_anything MaskDecoder/TwoWayTransformer unavailable; check sam_backbone.")
+    return MaskDecoder(
+        num_multimask_outputs=3,
+        transformer=TwoWayTransformer(
+            depth=2,
+            embedding_dim=prompt_embed_dim,
+            mlp_dim=2048,
+            num_heads=8,
+        ),
+        transformer_dim=prompt_embed_dim,
+        iou_head_depth=3,
+        iou_head_hidden_dim=256,
+    )
+
+
+def build_image_encoder_student_table2(*, img_size: int = 1024) -> nn.Module:
+    """
+    Student image encoder (supplementary Table 2) **with SAM neck kept** so mask decoder can run.
+    """
+    if ImageEncoderViT is None:
+        raise ImportError("segment_anything ImageEncoderViT unavailable; check sam_backbone.")
+    from functools import partial
+
+    return ImageEncoderViT(
+        img_size=img_size,
+        patch_size=16,
+        in_chans=3,
+        embed_dim=384,
+        depth=12,
+        num_heads=8,
+        mlp_ratio=4.0,
+        out_chans=256,
+        qkv_bias=True,
+        norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
+        act_layer=nn.GELU,
+        use_abs_pos=True,
+        use_rel_pos=True,
+        rel_pos_zero_init=True,
+        window_size=14,
+        global_attn_indexes=(2, 8),
+    )
+
+
+def build_teacher_image_encoder_vit_h_with_neck() -> nn.Module:
+    """Teacher image encoder ViT-H with SAM neck kept (required for mask decoder KD)."""
+    if ImageEncoderViT is None:
+        raise ImportError("segment_anything ImageEncoderViT unavailable; check sam_backbone.")
+    from functools import partial
+
+    return ImageEncoderViT(
+        depth=32,
+        embed_dim=1280,
+        img_size=1024,
+        patch_size=16,
+        mlp_ratio=4.0,
+        out_chans=256,
+        qkv_bias=True,
+        norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
+        act_layer=nn.GELU,
+        use_abs_pos=True,
+        use_rel_pos=True,
+        rel_pos_zero_init=True,
+        window_size=14,
+        global_attn_indexes=(7, 15, 23, 31),
+        num_heads=16,
+    )
+
+
+def load_sam_submodules_from_checkpoint(
+    *,
+    teacher_image_encoder: nn.Module,
+    teacher_prompt_encoder: nn.Module,
+    teacher_mask_decoder: nn.Module,
+    student_prompt_encoder: nn.Module,
+    student_mask_decoder: nn.Module,
+    checkpoint_path: str | Path,
+    strict: bool = False,
+) -> None:
+    """
+    Load `image_encoder.*`, `prompt_encoder.*`, `mask_decoder.*` from a SAM checkpoint.
+
+    Student prompt/mask modules are typically initialized from the same weights and frozen.
+    Student image encoder is intentionally NOT loaded (random init) for stage-1 distillation.
+    """
+    path = Path(checkpoint_path)
+    w = torch.load(path, map_location="cpu")
+    if isinstance(w, dict) and "model" in w:
+        w = w["model"]
+    if not isinstance(w, dict):
+        raise TypeError("Expected a SAM checkpoint state_dict (dict)")
+
+    def _sub(prefix: str) -> Dict[str, Tensor]:
+        p = prefix + "."
+        return {k[len(p) :]: v for k, v in w.items() if k.startswith(p)}
+
+    teacher_image_encoder.load_state_dict(_sub("image_encoder"), strict=strict)
+    teacher_prompt_encoder.load_state_dict(_sub("prompt_encoder"), strict=strict)
+    teacher_mask_decoder.load_state_dict(_sub("mask_decoder"), strict=strict)
+    # student prompt/mask decoders share the frozen teacher weights
+    student_prompt_encoder.load_state_dict(_sub("prompt_encoder"), strict=strict)
+    student_mask_decoder.load_state_dict(_sub("mask_decoder"), strict=strict)
+
+
+def kl_softmax_2class_from_binary_logits(z_s: Tensor, z_t: Tensor, tau: float) -> Tensor:
+    """
+    Paper-style KD on logits with temperature + softmax + τ² scaling, adapted to a single binary logit.
+
+    Given per-pixel scalar logits z (foreground), construct 2-class logits [0, z] (background, foreground).
+    This is equivalent to sigmoid-based Bernoulli distillation, but matches the softmax-KL form.
+    """
+    zs = (z_s / tau).reshape(-1)
+    zt = (z_t / tau).reshape(-1)
+    logits_s = torch.stack([torch.zeros_like(zs), zs], dim=-1)
+    logits_t = torch.stack([torch.zeros_like(zt), zt], dim=-1)
+    log_p_s = F.log_softmax(logits_s, dim=-1)
+    p_t = F.softmax(logits_t, dim=-1)
+    return F.kl_div(log_p_s, p_t, reduction="batchmean") * (tau**2)
+
+
+class LightSAMMultiplexDistillationDecoderKD(nn.Module):
+    """
+    Stage-1 distillation matching the paper's "KD = KM + KL" layout:
+    - KM (multiplex relation map): encoder block geometry alignment (same as `loss_md`).
+    - KL (output KD): KL on mask-decoder `low_res_masks` logits using box prompts.
+
+    Teacher: full SAM parts are frozen.
+    Student: image encoder trainable; prompt encoder + mask decoder frozen.
+    """
+
+    def __init__(
+        self,
+        *,
+        teacher_image_encoder: nn.Module,
+        student_image_encoder: nn.Module,
+        teacher_prompt_encoder: nn.Module,
+        student_prompt_encoder: nn.Module,
+        teacher_mask_decoder: nn.Module,
+        student_mask_decoder: nn.Module,
+        cfg: Optional[DistillConfig] = None,
+    ) -> None:
+        super().__init__()
+        self.cfg = cfg or DistillConfig()
+
+        self.teacher_image_encoder = teacher_image_encoder
+        self.teacher_prompt_encoder = teacher_prompt_encoder
+        self.teacher_mask_decoder = teacher_mask_decoder
+
+        self.student_image_encoder = student_image_encoder
+        self.student_prompt_encoder = student_prompt_encoder
+        self.student_mask_decoder = student_mask_decoder
+
+        for m in (self.teacher_image_encoder, self.teacher_prompt_encoder, self.teacher_mask_decoder):
+            for p in m.parameters():
+                p.requires_grad_(False)
+            m.eval()
+
+        for m in (self.student_prompt_encoder, self.student_mask_decoder):
+            for p in m.parameters():
+                p.requires_grad_(False)
+            m.eval()
+
+        n_t = len(self.teacher_image_encoder.blocks)
+        n_s = len(self.student_image_encoder.blocks)
+        self._teacher_idx_per_student = align_student_to_teacher_layers(n_s, n_t)
+        self.d_teacher = self.teacher_image_encoder.blocks[0].attn.qkv.in_features
+        self.d_student = self.student_image_encoder.blocks[0].attn.qkv.in_features
+
+    def forward(self, images: Tensor, boxes_xyxy: Tensor) -> Dict[str, Tensor]:
+        """
+        Args:
+            images: [B, 3, H, W] in 0–255 or 0–1; normalized to SAM stats inside.
+            boxes_xyxy: [B, 4] in resized-image pixel coords (same frame as images).
+        """
+        x = sam_normalize_images(images)
+
+        with torch.no_grad():
+            # teacher: (1) token blocks for KM, (2) neck output for mask decoder KL
+            _final_t_tok, blocks_t = sam_encoder_block_outputs(self.teacher_image_encoder, x)
+            emb_t = self.teacher_image_encoder(x)
+            sparse_t, dense_t = self.teacher_prompt_encoder(points=None, boxes=boxes_xyxy, masks=None)
+            low_res_t, _iou_t = self.teacher_mask_decoder(
+                image_embeddings=emb_t,
+                image_pe=self.teacher_prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_t,
+                dense_prompt_embeddings=dense_t,
+                multimask_output=True,
+            )
+
+        # student forward: prompt/mask are frozen but must remain in graph so grads reach image encoder
+        _final_s_tok, blocks_s = sam_encoder_block_outputs(self.student_image_encoder, x)
+        emb_s = self.student_image_encoder(x)
+        sparse_s, dense_s = self.student_prompt_encoder(points=None, boxes=boxes_xyxy, masks=None)
+        low_res_s, _iou_s = self.student_mask_decoder(
+            image_embeddings=emb_s,
+            image_pe=self.student_prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse_s,
+            dense_prompt_embeddings=dense_s,
+            multimask_output=True,
+        )
+
+        # KL on mask decoder low-res logits (paper-style τ² KL on softened distributions)
+        loss_kl = kl_softmax_2class_from_binary_logits(low_res_s, low_res_t, self.cfg.temperature)
+
+        # Multiplex relation map loss on aligned blocks (pre-neck token space)
+        # Need consistent token grid size; use teacher token shape to determine N.
+        b, h, w, _ = blocks_t[-1].shape
+        n = h * w
+        loss_md = low_res_s.new_tensor(0.0)
+        for ls, lt in enumerate(self._teacher_idx_per_student):
+            fs = blocks_s[ls].reshape(b, n, self.d_student)
+            ft = blocks_t[lt].reshape(b, n, self.d_teacher)
+            loss_md = loss_md + multiplex_relation_loss(fs, ft)
+        loss_md = loss_md / len(self._teacher_idx_per_student)
+
+        loss = self.cfg.weight_kl * loss_kl + self.cfg.weight_md * loss_md
+        return {"loss": loss, "loss_kl": loss_kl.detach(), "loss_md": loss_md.detach()}
+
+
+def distill_trainable_state_dict(distill_mod: nn.Module, meta: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+    """
+    Checkpoint for stage 1: trainable student parts only (teacher not saved).
+
+    Supports both:
+    - `LightSAMMultiplexDistillation` (encoder-only KL head): saves `student_encoder` + `kl_proj`
+    - `LightSAMMultiplexDistillationDecoderKD` (decoder-output KD): saves `student_encoder` only
+    """
+    if hasattr(distill_mod, "student") and hasattr(distill_mod, "kl_proj"):
+        out: Dict[str, object] = {
+            "student_encoder": getattr(distill_mod, "student").state_dict(),
+            "kl_proj": getattr(distill_mod, "kl_proj").state_dict(),
+        }
+    elif hasattr(distill_mod, "student_image_encoder"):
+        out = {"student_encoder": getattr(distill_mod, "student_image_encoder").state_dict()}
+    else:
+        raise TypeError("Unsupported distillation module type for checkpointing")
     if meta is not None:
         out["meta"] = meta
     return out
 
 
-def load_distill_trainable_state_dict(distill_mod: LightSAMMultiplexDistillation, state: Dict[str, object]) -> None:
-    distill_mod.student.load_state_dict(state["student_encoder"])
-    distill_mod.kl_proj.load_state_dict(state["kl_proj"])
+def load_distill_trainable_state_dict(distill_mod: nn.Module, state: Dict[str, object]) -> None:
+    if hasattr(distill_mod, "student") and hasattr(distill_mod, "kl_proj"):
+        getattr(distill_mod, "student").load_state_dict(state["student_encoder"])
+        getattr(distill_mod, "kl_proj").load_state_dict(state["kl_proj"])
+        return
+    if hasattr(distill_mod, "student_image_encoder"):
+        getattr(distill_mod, "student_image_encoder").load_state_dict(state["student_encoder"])
+        return
+    raise TypeError("Unsupported distillation module type for loading")
 
 
 def load_distilled_student_into_rdlnet(rdlnet: nn.Module, student_encoder: nn.Module) -> None:
@@ -268,7 +522,10 @@ def load_student_encoder_into_rdlnet_from_checkpoint(rdlnet: nn.Module, checkpoi
         raise KeyError("Expected a stage-1 checkpoint with key 'student_encoder', or a raw encoder state_dict.")
     if not hasattr(rdlnet, "backbone") or not hasattr(rdlnet.backbone, "encoder"):
         raise TypeError("Expected RDLNet with sam_backbone.RDLNetSAMEncoder")
-    rdlnet.backbone.encoder.load_state_dict(sd)
+    # Downstream `RDLNetSAMEncoder` deletes SAM neck; accept checkpoints that include neck weights.
+    if isinstance(sd, dict) and any(k.startswith("neck.") for k in sd.keys()):
+        sd = {k: v for k, v in sd.items() if not k.startswith("neck.")}
+    rdlnet.backbone.encoder.load_state_dict(sd, strict=False)
 
 
 def create_distillation_setup(

@@ -27,6 +27,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SAM_ROOT = _REPO_ROOT / "segment-anything"
 _IMPORT_ERR: Exception | None = None
 ImageEncoderViT: Type[nn.Module] | None = None
+PromptEncoder: Type[nn.Module] | None = None
+MaskDecoder: Type[nn.Module] | None = None
+TwoWayTransformer: Type[nn.Module] | None = None
 
 if _SAM_ROOT.is_dir():
     try:
@@ -49,17 +52,32 @@ if _SAM_ROOT.is_dir():
             p.__path__ = [str(_SAM_ROOT / "segment_anything" / "modeling")]  # type: ignore[attr-defined]
             sys.modules["segment_anything.modeling"] = p
 
-        _common_path = _SAM_ROOT / "segment_anything" / "modeling" / "common.py"
-        _enc_path = _SAM_ROOT / "segment_anything" / "modeling" / "image_encoder.py"
-        if _common_path.is_file() and _enc_path.is_file():
+        _modeling = _SAM_ROOT / "segment_anything" / "modeling"
+        _common_path = _modeling / "common.py"
+        _enc_path = _modeling / "image_encoder.py"
+        _prompt_path = _modeling / "prompt_encoder.py"
+        _mask_path = _modeling / "mask_decoder.py"
+        _tx_path = _modeling / "transformer.py"
+
+        if _common_path.is_file() and _enc_path.is_file() and _prompt_path.is_file() and _mask_path.is_file() and _tx_path.is_file():
             _load_module("segment_anything.modeling.common", _common_path)
+            _tx_mod = _load_module("segment_anything.modeling.transformer", _tx_path)
             _ie_mod = _load_module("segment_anything.modeling.image_encoder", _enc_path)
+            _pe_mod = _load_module("segment_anything.modeling.prompt_encoder", _prompt_path)
+            _md_mod = _load_module("segment_anything.modeling.mask_decoder", _mask_path)
+
+            TwoWayTransformer = _tx_mod.TwoWayTransformer
             ImageEncoderViT = _ie_mod.ImageEncoderViT
+            PromptEncoder = _pe_mod.PromptEncoder
+            MaskDecoder = _md_mod.MaskDecoder
         else:
             _IMPORT_ERR = FileNotFoundError("segment-anything modeling files missing")
     except Exception as e:  # pragma: no cover
         _IMPORT_ERR = e
         ImageEncoderViT = None
+        PromptEncoder = None
+        MaskDecoder = None
+        TwoWayTransformer = None
 else:
     _IMPORT_ERR = FileNotFoundError("segment-anything directory not found")
 
