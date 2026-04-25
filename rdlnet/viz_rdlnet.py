@@ -6,7 +6,7 @@ Preprocessed RWMD GT check: ``python -m rdlnet.viz_rdlnet --rwmd-root path/to/tr
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -232,9 +232,16 @@ def train_compare_grid_u8(
     max_samples: int = 4,
     mask_thresh: float = 0.5,
     n_corner_vis: int = 4,
-    matched_indices: Optional[List[Tuple[Tensor, Tensor]]] = None,
 ) -> np.ndarray:
-    """Return a grid: columns = [RGB | GT masks+points | pred masks+points], as RGB uint8 (H, W, 3)."""
+    """Return a grid: columns = [RGB | GT masks+points | pred masks+points], as RGB uint8 (H, W, 3).
+
+    Requires ``out[\"pred_logits\"]`` with shape ``[B, Nq, num_classes+1]`` (last class = no-object).
+
+    - **Corners (pred):** only the query with largest class-0 probability (same as val JI); other
+      queries' ``pred_points`` are not drawn.
+    - **Pred masks:** every query whose argmax class is **not** no-object (so foreground + background
+      instance masks); no-object queries are skipped. Main-doc query mask is drawn last so it stays on top.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
@@ -248,6 +255,9 @@ def train_compare_grid_u8(
     pred_masks = out["pred_masks"].float().cpu()
     pred_points = out["pred_points"].float().cpu()
     pred_prob = pred_masks.sigmoid()
+    if "pred_logits" not in out:
+        raise ValueError("train_compare_grid_u8 requires out['pred_logits']")
+    pred_logits = out["pred_logits"].float().cpu()
 
     ncols = 3
     fig, axes = plt.subplots(b, ncols, figsize=(4.2 * ncols, 3.5 * b), squeeze=False)
@@ -266,23 +276,21 @@ def train_compare_grid_u8(
         nq = int(pm.shape[0])
         ppts = pred_points[i].numpy()
 
-        use_match = matched_indices is not None and i < len(matched_indices)
-        if use_match:
-            src_i, tgt_i = matched_indices[i]
-            src_i = src_i.long().view(-1)
-            tgt_i = tgt_i.long().view(-1)
-            if tgt_i.numel() == 0:
-                pred_vis = rgb.copy()
-                pred_title = "pred (0 matched)"
-            else:
-                pairs = sorted(zip(src_i.tolist(), tgt_i.tolist()), key=lambda p: p[1])
-                pred_layers = [_resize_mask_to_hw(pm[int(s)], h, w) for s, _ in pairs]
-                pred_vis = _blend_instances(rgb.copy(), pred_layers, mask_thresh=mask_thresh)
-                pred_title = f"pred ({len(pairs)} matched)"
-        else:
-            pred_layers = [_resize_mask_to_hw(pm[q], h, w) for q in range(nq)]
-            pred_vis = _blend_instances(rgb.copy(), pred_layers, mask_thresh=mask_thresh)
-            pred_title = f"pred ({nq} q.)"
+        lg = pred_logits[i]
+        if lg.ndim != 2 or int(lg.shape[0]) != nq or int(lg.shape[1]) < 2:
+            raise ValueError(f"bad pred_logits[{i}]: shape={tuple(lg.shape)} nq={nq}")
+        probs = torch.softmax(lg, dim=-1)
+        no_idx = int(lg.shape[1]) - 1  # DETR-style: last logit = no-object
+        main_q = int(torch.argmax(probs[:, 0]).item())
+        pred_cls = probs.argmax(dim=-1)
+        others = [
+            q for q in range(nq) if int(pred_cls[q].item()) != no_idx and q != main_q
+        ]
+        main_is_obj = int(pred_cls[main_q].item()) != no_idx
+        mask_order = others + ([main_q] if main_is_obj else [])
+        pred_layers = [_resize_mask_to_hw(pm[q], h, w) for q in mask_order]
+        pred_vis = _blend_instances(rgb.copy(), pred_layers, mask_thresh=mask_thresh)
+        pred_title = f"pred ({len(pred_layers)} masks, corners q={main_q})"
 
         axes[i, 0].imshow(rgb)
         axes[i, 0].set_title("image")
@@ -301,16 +309,7 @@ def train_compare_grid_u8(
         axes[i, 2].imshow(pred_vis)
         axes[i, 2].set_title(pred_title)
         axes[i, 2].axis("off")
-        if use_match:
-            if tgt_i.numel() > 0:
-                pairs = sorted(zip(src_i.tolist(), tgt_i.tolist()), key=lambda p: p[1])
-                fg_set = set(fg.tolist())
-                for s, tj in pairs:
-                    if tj in fg_set:
-                        _draw_quad_corners(axes[i, 2], ppts[int(s)], h, w, f"C{tj % 10}", n_corner_vis)
-        else:
-            for q in range(nq):
-                _draw_quad_corners(axes[i, 2], ppts[q], h, w, f"C{q % 10}", n_corner_vis)
+        _draw_quad_corners(axes[i, 2], ppts[main_q], h, w, "C0", n_corner_vis)
 
     fig.suptitle("RDLNet: image | ground truth | prediction", fontsize=11, y=1.02)
     fig.tight_layout()

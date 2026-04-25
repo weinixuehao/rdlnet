@@ -161,6 +161,32 @@ def _forward_and_loss(
     return out, loss, logs
 
 
+def _log_compare_grid_to_tb(
+    tb: Any,
+    images: torch.Tensor,
+    out: dict[str, torch.Tensor],
+    tgt_labels: list[torch.Tensor],
+    tgt_masks: list[torch.Tensor],
+    tgt_points: list[torch.Tensor],
+    *,
+    tag: str,
+    global_step: int,
+    max_samples: int,
+) -> None:
+    if max_samples <= 0:
+        return
+    grid_u8 = train_compare_grid_u8(
+        images.detach().cpu(),
+        {k: v.detach().cpu() for k, v in out.items()},
+        [t.detach().cpu() for t in tgt_labels],
+        [t.detach().cpu() for t in tgt_masks],
+        [t.detach().cpu() for t in tgt_points],
+        max_samples=max_samples,
+    )
+    chw = np.transpose(grid_u8, (2, 0, 1))
+    tb.add_image(tag, chw, global_step=global_step, dataformats="CHW")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Stage 2: train RDLNet on annotated documents")
     p.add_argument("--annotations", type=str, default=None, help="JSON list (see rdlnet.data.doc_json)")
@@ -248,7 +274,7 @@ def parse_args() -> argparse.Namespace:
         "--viz-samples",
         type=int,
         default=4,
-        help="Grid PNG: max rows (batch images) per save; 0 disables all viz",
+        help="Compare grid: max batch rows per image; 0 disables train+val TensorBoard grids",
     )
     p.add_argument(
         "--viz-every-steps",
@@ -541,31 +567,16 @@ def main() -> None:
                         and args.viz_every_steps > 0
                         and optimizer_step % args.viz_every_steps == 0
                     ):
-                        with torch.no_grad():
-                            _mi = criterion.matcher(
-                                out["pred_logits"],
-                                out["pred_masks"],
-                                out["pred_points"],
-                                tgt_labels,
-                                tgt_masks,
-                                tgt_points,
-                            )
-                        matched_indices = [(a.cpu(), b.cpu()) for a, b in _mi]
-                        grid_u8 = train_compare_grid_u8(
-                            images.detach().cpu(),
-                            {k: v.detach().cpu() for k, v in out.items()},
-                            [t.detach().cpu() for t in tgt_labels],
-                            [t.detach().cpu() for t in tgt_masks],
-                            [t.detach().cpu() for t in tgt_points],
-                            max_samples=args.viz_samples,
-                            matched_indices=matched_indices,
-                        )
-                        chw = np.transpose(grid_u8, (2, 0, 1))
-                        tb.add_image(
-                            f"train/compare_grid/epoch_{epoch + 1:04d}/step_{optimizer_step:08d}",
-                            chw,
+                        _log_compare_grid_to_tb(
+                            tb,
+                            images,
+                            out,
+                            tgt_labels,
+                            tgt_masks,
+                            tgt_points,
+                            tag=f"train/compare_grid/epoch_{epoch + 1:04d}/step_{optimizer_step:08d}",
                             global_step=optimizer_step,
-                            dataformats="CHW",
+                            max_samples=args.viz_samples,
                         )
 
                     micro = 0
@@ -594,6 +605,7 @@ def main() -> None:
                 v_sums = LossSums()
                 ji_sum = 0.0
                 ji_n = 0
+                val_viz_logged = False
                 with torch.no_grad():
                     for vbi, batch in enumerate(tqdm(val_loader, desc=f"val {epoch + 1}/{end_epoch}", leave=False)):
                         paths = batch.get("paths") or []
@@ -612,6 +624,19 @@ def main() -> None:
                         if not torch.isfinite(loss).item():
                             continue
                         v_sums.update(loss, logs)
+                        if args.viz_samples > 0 and not val_viz_logged:
+                            val_viz_logged = True
+                            _log_compare_grid_to_tb(
+                                tb,
+                                images,
+                                out,
+                                tgt_labels,
+                                tgt_masks,
+                                tgt_points,
+                                tag=f"val/compare_grid/epoch_{ep_no:04d}",
+                                global_step=ep_no,
+                                max_samples=args.viz_samples,
+                            )
                         # JI (IoU) from main document quad corners (class_id=0).
                         probs0 = torch.softmax(out["pred_logits"].detach(), dim=-1)[..., 0]  # [B, Nq]
                         q_best = torch.argmax(probs0, dim=1)  # [B]

@@ -229,6 +229,8 @@ class RWMDLabelMeDataset(Dataset):
         self.img_size = img_size
         self.num_classes = num_classes
         self.num_points = num_points
+        if max_instances <= 0:
+            raise ValueError(f"max_instances must be > 0, got {max_instances}")
         self.max_instances = max_instances
         self.point_dim = num_points * 2
 
@@ -280,7 +282,9 @@ class RWMDLabelMeDataset(Dataset):
         masks: List[Tensor] = []
         points: List[Tensor] = []
 
-        for inst_id in ids[: self.max_instances]:
+        ids_kept = ids[-self.max_instances :]
+
+        for inst_id in ids_kept:
             bin_np = (m_u8 == inst_id).astype(np.float32)
             m = torch.from_numpy(bin_np).unsqueeze(0)
             m = F.interpolate(m.unsqueeze(0), size=(self.img_size, self.img_size), mode="nearest").squeeze(0).squeeze(0)
