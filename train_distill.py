@@ -129,6 +129,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-kl", type=float, default=1.0)
     p.add_argument("--weight-md", type=float, default=1.0)
     p.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=4.0,
+        help="Gradient clipping max norm. Set to 0 to disable.",
+    )
+    p.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -177,6 +183,9 @@ def main() -> None:
     use_amp = bool(args.amp and device.type == "cuda")
     if args.amp and device.type != "cuda":
         print("Warning: --amp is only supported on CUDA; training in fp32.")
+    if use_amp and not torch.cuda.is_bf16_supported():
+        print("Warning: CUDA device does not support bf16 autocast; disabling --amp (falling back to fp32).")
+        use_amp = False
     print(f"device => {device}")
     if device.type == "cuda":
         print(f"         ({torch.cuda.get_device_name(0)})")
@@ -341,6 +350,8 @@ def main() -> None:
                     accum=f"{accum_count}/{accum}",
                 )
                 if accum_count >= accum:
+                    if args.max_grad_norm and args.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=float(args.max_grad_norm))
                     did_step = _optimizer_step(opt)
                     if did_step:
                         scheduler.step()
@@ -359,6 +370,8 @@ def main() -> None:
             for p in distill.parameters():
                 if p.grad is not None:
                     p.grad.mul_(scale)
+            if args.max_grad_norm and args.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=float(args.max_grad_norm))
             did_step = _optimizer_step(opt)
             if did_step:
                 scheduler.step()

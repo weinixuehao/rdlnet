@@ -34,5 +34,5 @@ exec python train_distill.py \
   --grad-accum-steps 4 \
   --num-workers 4 \
   --lite 10 \
-  --amp
+  --amp \
   "$@"
