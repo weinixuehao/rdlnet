@@ -5,6 +5,8 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from dataclasses import fields
+from rdlnet.model import RDLNetConfig, apply_lite_preset
 
 _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO) not in sys.path:
@@ -55,24 +57,33 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _load_cfg(ckpt: dict, *, img_size: int, num_classes: int | None, use_sam_pixel_norm: bool):
-    from rdlnet.model import RDLNetConfig
-
+def _load_cfg(ckpt: dict, *, img_size: int, num_classes: int | None):
     cfg_dict = ckpt.get("config") if isinstance(ckpt.get("config"), dict) else {}
-    nc = num_classes
-    if nc is None:
-        try:
-            nc = int(cfg_dict.get("num_classes"))
-        except Exception:
-            nc = None
-    if nc is None:
-        nc = 2
 
-    return RDLNetConfig(
-        img_size=img_size,
-        num_classes=nc,
-        use_sam_pixel_norm=use_sam_pixel_norm,
-    )
+    # train_rdlnet saves `config = asdict(cfg)` (see train_rdlnet.py), so this should contain the
+    # *fully materialized* architecture (already after apply_lite_preset).
+    # For robustness, also support older checkpoints that store only `lite`.
+    field_names = {f.name for f in fields(RDLNetConfig)}
+    init_kwargs: dict = {}
+    for k, v in cfg_dict.items():
+        if k in field_names:
+            init_kwargs[k] = v
+
+    # Always let export-time args override these.
+    init_kwargs["img_size"] = int(img_size)
+    if num_classes is not None:
+        init_kwargs["num_classes"] = int(num_classes)
+    else:
+        # Default fallback only when ckpt doesn't carry num_classes.
+        if "num_classes" not in init_kwargs:
+            init_kwargs["num_classes"] = 2
+    # Export uses a wrapper for fixed preprocessing (export-friendly). Keep the core model free of
+    # data-dependent preprocessing branches.
+    init_kwargs["use_sam_pixel_norm"] = False
+
+    cfg = RDLNetConfig(**init_kwargs)
+
+    return cfg
 
 
 def export_tflite(
@@ -108,7 +119,7 @@ def export_tflite(
 
     # IMPORTANT: RDLNet._preprocess_pixels contains a data-dependent branch (x.max()) that can break export.
     # Keep the core model free of such branches and apply fixed preprocessing in the wrapper.
-    cfg = _load_cfg(ckpt, img_size=img_size, num_classes=num_classes, use_sam_pixel_norm=False)
+    cfg = _load_cfg(ckpt, img_size=img_size, num_classes=num_classes)
     model = RDLNet(cfg)
     model.load_state_dict(ckpt["model"])
     model.eval()

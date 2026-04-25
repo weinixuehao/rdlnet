@@ -13,3 +13,6 @@ dataset/*
 dataset/RWMD_dataset/*
 !dataset/RWMD_dataset/data_preprocessing_rwdm_1.py
 output
+build
+.cache
+doc/imgs
