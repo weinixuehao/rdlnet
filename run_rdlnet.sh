@@ -10,6 +10,8 @@
 #
 # Do not set RESUME and also pass --resume (duplicate flags).
 #
+# If using --distill-checkpoint, use the same --lite (40|20|10) as stage-1 train_distill (COCO or folder).
+#
 # Requires LF line endings (Unix). On macOS and Ubuntu, prefer .venv/bin/python when present.
 
 set -eu
@@ -31,7 +33,7 @@ exec python train_rdlnet.py \
   --resume output/rdlnet/20260424_111048 \
   --num-classes 2 \
   --output output/rdlnet \
-  --lite 20 \
+  --lite 10 \
   --epochs 500 \
   --batch-size 2 \
   --grad-accum-steps 4 \

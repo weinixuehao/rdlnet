@@ -38,7 +38,7 @@ from rdlnet.device import pick_device
 from rdlnet.distill import (
     DistillConfig,
     LightSAMMultiplexDistillationDecoderKD,
-    build_image_encoder_student_table2,
+    build_sam_vit_for_rdlnet_cfg,
     build_sam_mask_decoder,
     build_sam_prompt_encoder,
     build_teacher_image_encoder_vit_h_with_neck,
@@ -47,6 +47,7 @@ from rdlnet.distill import (
     load_distill_trainable_state_dict,
     load_sam_submodules_from_checkpoint,
 )
+from rdlnet.model import RDLNetConfig, apply_lite_preset
 from rdlnet.sam_backbone import RDLNetSAMEncoder
 
 
@@ -187,6 +188,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="CUDA mixed precision (fp16 forward under autocast, fp32 master weights + GradScaler). Ignored on non-CUDA.",
     )
+    p.add_argument(
+        "--lite",
+        type=int,
+        default=40,
+        choices=[10, 20, 40],
+        help="Student ViT size (COCO and folder); must match train_rdlnet --lite for --distill-checkpoint; "
+        "see apply_lite_preset in rdlnet/model.py.",
+    )
     return p.parse_args()
 
 
@@ -231,6 +240,9 @@ def main() -> None:
         teacher_checkpoint=args.teacher_checkpoint,
     )
 
+    rdl_cfg = RDLNetConfig(img_size=args.img_size, use_sam_pixel_norm=True)
+    apply_lite_preset(rdl_cfg, int(args.lite))
+
     if args.coco:
         ds = CocoTrain2017BoxPrompts(
             images=args.coco_train_dir,
@@ -239,7 +251,7 @@ def main() -> None:
             seed=args.seed,
             instances_per_image=1,
         )
-        student_image_encoder = build_image_encoder_student_table2(img_size=args.img_size)
+        student_image_encoder = build_sam_vit_for_rdlnet_cfg(rdl_cfg)
         teacher_image_encoder = build_teacher_image_encoder_vit_h_with_neck()
         teacher_prompt = build_sam_prompt_encoder(img_size=args.img_size)
         student_prompt = build_sam_prompt_encoder(img_size=args.img_size)
@@ -266,6 +278,10 @@ def main() -> None:
         trainable_params = [p for p in distill.parameters() if p.requires_grad]
         opt = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
         student_wrap = None
+        print(
+            f"distill student (coco): lite={args.lite}  backbone embed_dim={rdl_cfg.backbone_dim}  "
+            f"depth={rdl_cfg.backbone_depth}  (align: train_rdlnet.py --lite {args.lite})"
+        )
     else:
         ds = DistillImageFolder(
             args.image_dir,
@@ -278,7 +294,20 @@ def main() -> None:
                 f"samples_per_epoch={args.samples_per_epoch}  |  pool_size={ds.pool_size}  |  subset_seed={args.seed} "
                 "(deterministic subset per global epoch index; not a full pass per epoch)"
             )
-        student_wrap = RDLNetSAMEncoder(img_size=args.img_size)
+        student_wrap = RDLNetSAMEncoder(
+            img_size=rdl_cfg.img_size,
+            patch_size=rdl_cfg.patch_size,
+            embed_dim=rdl_cfg.backbone_dim,
+            depth=rdl_cfg.backbone_depth,
+            num_heads=rdl_cfg.backbone_heads,
+            mlp_ratio=4.0,
+            window_size=rdl_cfg.sam_window_size,
+            global_attn_indexes=rdl_cfg.sam_global_attn_indexes,
+        )
+        print(
+            f"distill student (folder): lite={args.lite}  backbone embed_dim={rdl_cfg.backbone_dim}  "
+            f"depth={rdl_cfg.backbone_depth}  (align: train_rdlnet.py --lite {args.lite})"
+        )
         distill = create_distillation_setup(
             student_wrap.encoder,
             teacher_checkpoint=args.teacher_checkpoint,
@@ -482,6 +511,9 @@ def main() -> None:
                 best_val_kd = val_kd
                 meta_best = {
                     "img_size": args.img_size,
+                    "backbone_dim": rdl_cfg.backbone_dim,
+                    "backbone_depth": rdl_cfg.backbone_depth,
+                    "lite": int(args.lite),
                     "epochs_done": epoch + 1,
                     "seed": args.seed,
                     "amp": use_amp,
@@ -500,8 +532,9 @@ def main() -> None:
 
         meta = {
             "img_size": args.img_size,
-            "backbone_dim": getattr(student_wrap, "embed_dim", None),
-            "backbone_depth": getattr(student_wrap, "depth", None),
+            "backbone_dim": rdl_cfg.backbone_dim,
+            "backbone_depth": rdl_cfg.backbone_depth,
+            "lite": int(args.lite),
             "epochs_done": epoch + 1,
             "grad_accum_steps": args.grad_accum_steps,
             "samples_per_epoch": args.samples_per_epoch,

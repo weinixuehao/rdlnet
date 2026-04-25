@@ -48,7 +48,7 @@ from rdlnet.data import DocLocalizationJsonDataset, RWMDLabelMeDataset, collate_
 from rdlnet.device import pick_device
 from rdlnet.distill import load_student_encoder_into_rdlnet_from_checkpoint
 from rdlnet.losses import RDLNetLoss, build_matcher
-from rdlnet.model import RDLNet, RDLNetConfig
+from rdlnet.model import RDLNet, RDLNetConfig, apply_lite_preset
 from rdlnet.viz_rdlnet import train_compare_grid_u8
 
 LOSS_HISTORY_KEY = "train_rdlnet_loss_history"
@@ -260,8 +260,9 @@ def parse_args() -> argparse.Namespace:
         "--lite",
         type=int,
         default=40,
-        choices=[40, 20],
-        help="Lightweight preset: 40 = default (paper-ish), 20 = smaller backbone/decoder dims.",
+        choices=[40, 20, 10],
+        help="Size preset (must match stage-1 --lite when using --distill-checkpoint). "
+        "40=default, 20≈20M, 10≈10M (faster train/distill, see apply_lite_preset in model.py).",
     )
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument(
@@ -353,11 +354,7 @@ def main() -> None:
         num_classes=num_classes,
         use_sam_pixel_norm=True,
     )
-    if int(args.lite) == 20:
-        # Keep heads unchanged (8) so dims remain divisible.
-        cfg.backbone_dim = 256
-        cfg.hidden_dim = 192
-        cfg.ffn_dim = 1024
+    apply_lite_preset(cfg, int(args.lite))
     if args.img_size % cfg.patch_size != 0:
         raise ValueError("img_size must be divisible by patch_size")
 
@@ -490,7 +487,7 @@ def main() -> None:
                 "Example: --output output/rdlnet"
             )
         run_ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-        run_dir = out_root / run_ts
+        run_dir = out_root / f"{run_ts}_lite{int(args.lite)}"
         run_dir.mkdir(parents=True, exist_ok=True)
     print(f"run directory => {run_dir}")
 
@@ -605,7 +602,13 @@ def main() -> None:
                 v_sums = LossSums()
                 ji_sum = 0.0
                 ji_n = 0
-                val_viz_logged = False
+                val_len = len(val_loader)
+                val_plan = val_len if max_batches <= 0 else min(val_len, max_batches)
+                val_viz_bi = (
+                    int(np.random.randint(0, val_plan))
+                    if args.viz_samples > 0 and val_plan > 0
+                    else -1
+                )
                 with torch.no_grad():
                     for vbi, batch in enumerate(tqdm(val_loader, desc=f"val {epoch + 1}/{end_epoch}", leave=False)):
                         paths = batch.get("paths") or []
@@ -624,8 +627,7 @@ def main() -> None:
                         if not torch.isfinite(loss).item():
                             continue
                         v_sums.update(loss, logs)
-                        if args.viz_samples > 0 and not val_viz_logged:
-                            val_viz_logged = True
+                        if args.viz_samples > 0 and vbi == val_viz_bi:
                             _log_compare_grid_to_tb(
                                 tb,
                                 images,
@@ -633,7 +635,7 @@ def main() -> None:
                                 tgt_labels,
                                 tgt_masks,
                                 tgt_points,
-                                tag=f"val/compare_grid/epoch_{ep_no:04d}",
+                                tag=f"val/compare_grid/epoch_{ep_no:04d}/batch_{vbi:04d}",
                                 global_step=ep_no,
                                 max_samples=args.viz_samples,
                             )

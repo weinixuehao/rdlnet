@@ -41,6 +41,37 @@ class RDLNetConfig:
     encoder_n_points: int = 4
 
 
+def apply_lite_preset(cfg: "RDLNetConfig", lite: int) -> None:
+    """
+    Shrink the full model for faster training / inference. **Single source of truth** for
+    stage-1 ``train_distill`` and stage-2 ``train_rdlnet``: pass the same ``--lite`` so
+    ``--distill-checkpoint`` matches ``RDLNet.backbone`` (COCO and folder use the same student shape).
+
+    - ``40``: default (Table 3--style widths / depths); no change to ``cfg``.
+    - ``20``: narrower backbone/head; ~20M parameters (measured in-repo).
+    - ``10``: ~10M total parameters: ViT depth 8, head width 128, 3 enc/dec layers, ffn 512.
+    """
+    if lite not in (10, 20, 40):
+        raise ValueError(f"lite must be 10, 20, or 40, got {lite}")
+    if lite == 40:
+        return
+    if lite == 20:
+        cfg.backbone_dim = 256
+        cfg.backbone_depth = 12
+        cfg.sam_global_attn_indexes = (2, 8)
+        cfg.hidden_dim = 192
+        cfg.ffn_dim = 1024
+        return
+    # ~10.04M full RDLNet (num_classes=2, measured in-repo)
+    cfg.backbone_dim = 256
+    cfg.backbone_depth = 8
+    cfg.sam_global_attn_indexes = (2, 5)
+    cfg.hidden_dim = 128
+    cfg.ffn_dim = 512
+    cfg.num_encoder_layers = 3
+    cfg.num_decoder_layers = 3
+
+
 def _init_deformable_attn(m: nn.Module) -> None:
     if isinstance(m, MultiScaleDeformableAttention):
         nn.init.constant_(m.sampling_offsets.weight, 0.0)

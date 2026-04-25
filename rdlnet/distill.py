@@ -265,21 +265,24 @@ def build_sam_mask_decoder(*, prompt_embed_dim: int = 256) -> nn.Module:
     )
 
 
-def build_image_encoder_student_table2(*, img_size: int = 1024) -> nn.Module:
+def build_sam_vit_for_rdlnet_cfg(cfg) -> nn.Module:
     """
-    Student image encoder (supplementary Table 2) **with SAM neck kept** so mask decoder can run.
+    Student ``ImageEncoderViT`` **with** SAM neck (needed for COCO box-prompt + mask-decoder KD).
+
+    Width/depth/window come from :class:`rdlnet.model.RDLNetConfig` after
+    :func:`rdlnet.model.apply_lite_preset` so the checkpoint matches stage-2 ``RDLNet.backbone``.
     """
     if ImageEncoderViT is None:
         raise ImportError("segment_anything ImageEncoderViT unavailable; check sam_backbone.")
     from functools import partial
 
     return ImageEncoderViT(
-        img_size=img_size,
-        patch_size=16,
+        img_size=cfg.img_size,
+        patch_size=cfg.patch_size,
         in_chans=3,
-        embed_dim=384,
-        depth=12,
-        num_heads=8,
+        embed_dim=cfg.backbone_dim,
+        depth=cfg.backbone_depth,
+        num_heads=cfg.backbone_heads,
         mlp_ratio=4.0,
         out_chans=256,
         qkv_bias=True,
@@ -288,9 +291,21 @@ def build_image_encoder_student_table2(*, img_size: int = 1024) -> nn.Module:
         use_abs_pos=True,
         use_rel_pos=True,
         rel_pos_zero_init=True,
-        window_size=14,
-        global_attn_indexes=(2, 8),
+        window_size=cfg.sam_window_size,
+        global_attn_indexes=tuple(cfg.sam_global_attn_indexes),
     )
+
+
+def build_image_encoder_student_table2(*, img_size: int = 1024) -> nn.Module:
+    """
+    Student image encoder (supplementary Table 2) **with SAM neck** — same as
+    ``build_sam_vit_for_rdlnet_cfg(apply_lite_preset(RDLNetConfig, 40))``.
+    """
+    from .model import RDLNetConfig, apply_lite_preset
+
+    cfg = RDLNetConfig(img_size=img_size, use_sam_pixel_norm=True)
+    apply_lite_preset(cfg, 40)
+    return build_sam_vit_for_rdlnet_cfg(cfg)
 
 
 def build_teacher_image_encoder_vit_h_with_neck() -> nn.Module:
