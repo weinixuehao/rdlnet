@@ -30,7 +30,7 @@ exec python train_distill.py \
   --output checkpoints/distill \
   --seed 42 \
   --epochs 1000 \
-  --batch-size 2 \
+  --batch-size 1 \
   --grad-accum-steps 4 \
   --num-workers 4 \
   --lite 10 \
