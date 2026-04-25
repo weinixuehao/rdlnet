@@ -22,7 +22,7 @@ from datetime import datetime
 
 import torch
 import torch.nn as nn
-from torch.amp import GradScaler, autocast
+from torch.amp import autocast
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import MultiStepLR
@@ -50,21 +50,13 @@ from rdlnet.model import RDLNetConfig, apply_lite_preset
 
 def _optimizer_step(
     opt: torch.optim.Optimizer,
-    scaler: GradScaler | None,
 ) -> bool:
     """
     Returns True iff parameters were actually updated.
-    With AMP, GradScaler can skip optimizer.step() on overflow; we must not advance scheduler/step then.
+    BF16 autocast does not require GradScaler; optimizer.step() always runs.
     """
-    if scaler is None:
-        opt.step()
-        return True
-    scale_before = float(scaler.get_scale())
-    scaler.step(opt)
-    scaler.update()
-    scale_after = float(scaler.get_scale())
-    # If overflow happened, GradScaler reduces the scale and skips the step.
-    return scale_after >= scale_before
+    opt.step()
+    return True
 
 
 def collate_distill_coco_box(batch):
@@ -90,7 +82,7 @@ def validate_one_epoch_coco(
     for imgs, boxes, _meta in loader:
         imgs = imgs.to(device)
         boxes = boxes.to(device)
-        with autocast("cuda", enabled=use_amp):
+        with autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             out = distill(imgs, boxes)
         loss_sum += float(out["loss"].detach())
         kl_sum += float(out["loss_kl"].detach())
@@ -118,7 +110,7 @@ def parse_args() -> argparse.Namespace:
         "--resume",
         type=str,
         default=None,
-        help="Resume from stage-1 checkpoint.pt (weights + optimizer/scheduler/scaler if present). "
+        help="Resume from stage-1 checkpoint.pt (weights + optimizer/scheduler if present). "
         "Note: best.pt is not resumable.",
     )
     p.add_argument("--epochs", type=int, default=1, help="Number of additional epochs to run in this session")
@@ -140,12 +132,12 @@ def parse_args() -> argparse.Namespace:
         "--seed",
         type=int,
         default=42,
-        help="RNG seed: torch/random, DataLoader shuffle, and (with --samples-per-epoch) subset indices per epoch",
+        help="RNG seed: torch/random and DataLoader shuffle",
     )
     p.add_argument(
         "--amp",
         action="store_true",
-        help="CUDA mixed precision (fp16 forward under autocast, fp32 master weights + GradScaler). Ignored on non-CUDA.",
+        help="CUDA mixed precision (bf16 forward under autocast). Ignored on non-CUDA.",
     )
     p.add_argument(
         "--lite",
@@ -158,12 +150,12 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _make_run_dir(output_root: str | Path) -> Path:
+def _make_run_dir(output_root: str | Path, *, lite: int) -> Path:
     root = Path(output_root)
     root.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # Always create a unique folder per run (timestamp-based).
-    return root / stamp
+    # Always create a unique folder per run (timestamp-based), but include key config in name.
+    return root / f"{stamp}_lite{int(lite)}"
 
 
 def _make_tb_writer(run_dir: Path) -> SummaryWriter:
@@ -188,7 +180,7 @@ def main() -> None:
     print(f"device => {device}")
     if device.type == "cuda":
         print(f"         ({torch.cuda.get_device_name(0)})")
-    print(f"AMP (fp16 autocast): {'on' if use_amp else 'off'}")
+    print(f"AMP (bf16 autocast): {'on' if use_amp else 'off'}")
 
     cfg = DistillConfig(
         temperature=args.temperature,
@@ -237,7 +229,6 @@ def main() -> None:
         f"distill student (coco): lite={args.lite}  backbone embed_dim={rdl_cfg.backbone_dim}  "
         f"depth={rdl_cfg.backbone_depth}  (align: train_rdlnet.py --lite {args.lite})"
     )
-    scaler: GradScaler | None = GradScaler("cuda") if use_amp else None
     scheduler = MultiStepLR(opt, milestones=[40_000, 80_000, 120_000], gamma=0.1)
 
     start_epoch = 0
@@ -266,16 +257,14 @@ def main() -> None:
         if ck_seed is not None and int(ck_seed) != args.seed:
             print(
                 f"Warning: --seed ({args.seed}) != checkpoint meta seed ({int(ck_seed)}); "
-                "subset/DataLoader order may differ from the run that wrote this file."
+                "DataLoader order may differ from the run that wrote this file."
             )
         ck_amp = (ck.get("meta") or {}).get("amp")
         if ck_amp is not None and bool(ck_amp) != use_amp:
             print(
                 f"Warning: --amp ({use_amp}) != checkpoint meta amp ({bool(ck_amp)}); "
-                "optimizer/scaler state may be mismatched."
+                "optimizer state may be mismatched."
             )
-        if scaler is not None and isinstance(ck.get("scaler"), dict):
-            scaler.load_state_dict(ck["scaler"])
         if isinstance(ck.get("best_val_kd"), (int, float)):
             best_val_kd = float(ck["best_val_kd"])
 
@@ -303,7 +292,7 @@ def main() -> None:
         pin_memory=device.type == "cuda",
     )
 
-    run_dir = _make_run_dir(args.output)
+    run_dir = _make_run_dir(args.output, lite=int(args.lite))
     run_dir.mkdir(parents=True, exist_ok=True)
     out_path = run_dir / "checkpoint.pt"
     best_ckpt = run_dir / "best.pt"
@@ -335,13 +324,10 @@ def main() -> None:
                 imgs, boxes, _meta = batch
                 imgs = imgs.to(device)
                 boxes = boxes.to(device)
-                with autocast("cuda", enabled=use_amp):
+                with autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
                     out = distill(imgs, boxes)
                 loss = out["loss"]
-                if scaler is not None:
-                    scaler.scale(loss / accum).backward()
-                else:
-                    (loss / accum).backward()
+                (loss / accum).backward()
                 accum_count += 1
                 epoch_loss_sum += float(loss.detach())
                 epoch_kl_sum += float(out["loss_kl"].detach())
@@ -355,7 +341,7 @@ def main() -> None:
                     accum=f"{accum_count}/{accum}",
                 )
                 if accum_count >= accum:
-                    did_step = _optimizer_step(opt, scaler)
+                    did_step = _optimizer_step(opt)
                     if did_step:
                         scheduler.step()
                     opt.zero_grad(set_to_none=True)
@@ -370,12 +356,10 @@ def main() -> None:
 
         if accum_count > 0:
             scale = accum / accum_count
-            if scaler is not None:
-                scaler.unscale_(opt)
             for p in distill.parameters():
                 if p.grad is not None:
                     p.grad.mul_(scale)
-            did_step = _optimizer_step(opt, scaler)
+            did_step = _optimizer_step(opt)
             if did_step:
                 scheduler.step()
             opt.zero_grad(set_to_none=True)
@@ -441,8 +425,6 @@ def main() -> None:
         ckpt["scheduler"] = scheduler.state_dict()
         ckpt["global_step"] = global_step
         ckpt["best_val_kd"] = best_val_kd
-        if scaler is not None:
-            ckpt["scaler"] = scaler.state_dict()
         torch.save(ckpt, out_path)
         print(f"Saved checkpoint to {out_path}")
     finally:
