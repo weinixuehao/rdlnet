@@ -5,11 +5,10 @@ Stage 1: Light-SAM multiplex distillation (paper Sec. 3.1).
 Example::
 
     python train_distill.py \\
-        --image-dir /path/to/unlabeled/images \\
         --teacher-checkpoint /path/to/sam_vit_h_4b8939.pth \\
         --output output/distill
 
-Requires: SAM ViT-H weights and a folder of RGB images (any domain; natural images OK).
+Requires: Extracted COCO train/val images + instances json, plus SAM ViT-H weights.
 """
 
 from __future__ import annotations
@@ -33,7 +32,7 @@ _REPO = Path(__file__).resolve().parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from rdlnet.data import CocoTrain2017BoxPrompts, DistillImageFolder
+from rdlnet.data import CocoTrain2017BoxPrompts
 from rdlnet.device import pick_device
 from rdlnet.distill import (
     DistillConfig,
@@ -42,13 +41,11 @@ from rdlnet.distill import (
     build_sam_mask_decoder,
     build_sam_prompt_encoder,
     build_teacher_image_encoder_vit_h_with_neck,
-    create_distillation_setup,
     distill_trainable_state_dict,
     load_distill_trainable_state_dict,
     load_sam_submodules_from_checkpoint,
 )
 from rdlnet.model import RDLNetConfig, apply_lite_preset
-from rdlnet.sam_backbone import RDLNetSAMEncoder
 
 
 def _optimizer_step(
@@ -68,12 +65,6 @@ def _optimizer_step(
     scale_after = float(scaler.get_scale())
     # If overflow happened, GradScaler reduces the scale and skips the step.
     return scale_after >= scale_before
-
-
-def collate_distill(batch):
-    imgs = torch.stack([b[0] for b in batch], dim=0)
-    paths = [b[1] for b in batch]
-    return imgs, paths
 
 
 def collate_distill_coco_box(batch):
@@ -110,44 +101,12 @@ def validate_one_epoch_coco(
     return loss_sum / n, kl_sum / n, md_sum / n
 
 
-def make_distill_loader(
-    ds: DistillImageFolder,
-    batch_size: int,
-    num_workers: int,
-    device: torch.device,
-    *,
-    seed: int,
-    epoch_index: int,
-) -> DataLoader:
-    g = torch.Generator()
-    g.manual_seed(seed + epoch_index * 1_000_003)
-    return DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=collate_distill,
-        pin_memory=device.type == "cuda",
-        generator=g,
-    )
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Stage 1: distill Light-SAM student from SAM ViT-H")
-    src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--image-dir", type=str, default=None, help="Directory of RGB images (recursive) [encoder-only distill]")
-    src.add_argument("--coco", action="store_true", help="Use extracted COCO train2017/ + instances json (box prompts + decoder KD)")
     p.add_argument("--coco-train-dir", type=str, default="dataset/coco/train2017", help="Extracted COCO train2017/ directory")
     p.add_argument("--coco-instances-json", type=str, default="dataset/coco/annotations/instances_train2017.json")
     p.add_argument("--coco-val-dir", type=str, default="dataset/coco/val2017", help="Extracted COCO val2017/ directory")
     p.add_argument("--coco-val-instances-json", type=str, default="dataset/coco/annotations/instances_val2017.json")
-    p.add_argument(
-        "--samples-per-epoch",
-        type=int,
-        default=None,
-        help="Each epoch: random sample this many images from the full pool (no replacement). "
-        "Omits to use every image once per epoch (full pass).",
-    )
     p.add_argument("--teacher-checkpoint", type=str, required=True, help="sam_vit_h_4b8939.pth")
     p.add_argument(
         "--output",
@@ -217,8 +176,6 @@ def main() -> None:
     args = parse_args()
     if args.grad_accum_steps < 1:
         raise SystemExit("--grad-accum-steps must be >= 1")
-    if args.samples_per_epoch is not None and args.samples_per_epoch < 1:
-        raise SystemExit("--samples-per-epoch must be >= 1")
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -243,78 +200,43 @@ def main() -> None:
     rdl_cfg = RDLNetConfig(img_size=args.img_size, use_sam_pixel_norm=True)
     apply_lite_preset(rdl_cfg, int(args.lite))
 
-    if args.coco:
-        ds = CocoTrain2017BoxPrompts(
-            images=args.coco_train_dir,
-            instances_json=args.coco_instances_json,
-            img_size=args.img_size,
-            seed=args.seed,
-            instances_per_image=1,
-        )
-        student_image_encoder = build_sam_vit_for_rdlnet_cfg(rdl_cfg)
-        teacher_image_encoder = build_teacher_image_encoder_vit_h_with_neck()
-        teacher_prompt = build_sam_prompt_encoder(img_size=args.img_size)
-        student_prompt = build_sam_prompt_encoder(img_size=args.img_size)
-        teacher_mask = build_sam_mask_decoder()
-        student_mask = build_sam_mask_decoder()
-        load_sam_submodules_from_checkpoint(
-            teacher_image_encoder=teacher_image_encoder,
-            teacher_prompt_encoder=teacher_prompt,
-            teacher_mask_decoder=teacher_mask,
-            student_prompt_encoder=student_prompt,
-            student_mask_decoder=student_mask,
-            checkpoint_path=args.teacher_checkpoint,
-            strict=False,
-        )
-        distill = LightSAMMultiplexDistillationDecoderKD(
-            teacher_image_encoder=teacher_image_encoder,
-            student_image_encoder=student_image_encoder,
-            teacher_prompt_encoder=teacher_prompt,
-            student_prompt_encoder=student_prompt,
-            teacher_mask_decoder=teacher_mask,
-            student_mask_decoder=student_mask,
-            cfg=cfg,
-        ).to(device)
-        trainable_params = [p for p in distill.parameters() if p.requires_grad]
-        opt = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
-        student_wrap = None
-        print(
-            f"distill student (coco): lite={args.lite}  backbone embed_dim={rdl_cfg.backbone_dim}  "
-            f"depth={rdl_cfg.backbone_depth}  (align: train_rdlnet.py --lite {args.lite})"
-        )
-    else:
-        ds = DistillImageFolder(
-            args.image_dir,
-            img_size=args.img_size,
-            samples_per_epoch=args.samples_per_epoch,
-            subset_seed=args.seed,
-        )
-        if args.samples_per_epoch is not None:
-            print(
-                f"samples_per_epoch={args.samples_per_epoch}  |  pool_size={ds.pool_size}  |  subset_seed={args.seed} "
-                "(deterministic subset per global epoch index; not a full pass per epoch)"
-            )
-        student_wrap = RDLNetSAMEncoder(
-            img_size=rdl_cfg.img_size,
-            patch_size=rdl_cfg.patch_size,
-            embed_dim=rdl_cfg.backbone_dim,
-            depth=rdl_cfg.backbone_depth,
-            num_heads=rdl_cfg.backbone_heads,
-            mlp_ratio=4.0,
-            window_size=rdl_cfg.sam_window_size,
-            global_attn_indexes=rdl_cfg.sam_global_attn_indexes,
-        )
-        print(
-            f"distill student (folder): lite={args.lite}  backbone embed_dim={rdl_cfg.backbone_dim}  "
-            f"depth={rdl_cfg.backbone_depth}  (align: train_rdlnet.py --lite {args.lite})"
-        )
-        distill = create_distillation_setup(
-            student_wrap.encoder,
-            teacher_checkpoint=args.teacher_checkpoint,
-            cfg=cfg,
-        ).to(device)
-        trainable_params = [p for p in distill.parameters() if p.requires_grad]
-        opt = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    ds = CocoTrain2017BoxPrompts(
+        images=args.coco_train_dir,
+        instances_json=args.coco_instances_json,
+        img_size=args.img_size,
+        seed=args.seed,
+        instances_per_image=1,
+    )
+    student_image_encoder = build_sam_vit_for_rdlnet_cfg(rdl_cfg)
+    teacher_image_encoder = build_teacher_image_encoder_vit_h_with_neck()
+    teacher_prompt = build_sam_prompt_encoder(img_size=args.img_size)
+    student_prompt = build_sam_prompt_encoder(img_size=args.img_size)
+    teacher_mask = build_sam_mask_decoder()
+    student_mask = build_sam_mask_decoder()
+    load_sam_submodules_from_checkpoint(
+        teacher_image_encoder=teacher_image_encoder,
+        teacher_prompt_encoder=teacher_prompt,
+        teacher_mask_decoder=teacher_mask,
+        student_prompt_encoder=student_prompt,
+        student_mask_decoder=student_mask,
+        checkpoint_path=args.teacher_checkpoint,
+        strict=False,
+    )
+    distill = LightSAMMultiplexDistillationDecoderKD(
+        teacher_image_encoder=teacher_image_encoder,
+        student_image_encoder=student_image_encoder,
+        teacher_prompt_encoder=teacher_prompt,
+        student_prompt_encoder=student_prompt,
+        teacher_mask_decoder=teacher_mask,
+        student_mask_decoder=student_mask,
+        cfg=cfg,
+    ).to(device)
+    trainable_params = [p for p in distill.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    print(
+        f"distill student (coco): lite={args.lite}  backbone embed_dim={rdl_cfg.backbone_dim}  "
+        f"depth={rdl_cfg.backbone_depth}  (align: train_rdlnet.py --lite {args.lite})"
+    )
     scaler: GradScaler | None = GradScaler("cuda") if use_amp else None
     scheduler = MultiStepLR(opt, milestones=[40_000, 80_000, 120_000], gamma=0.1)
 
@@ -357,41 +279,29 @@ def main() -> None:
         if isinstance(ck.get("best_val_kd"), (int, float)):
             best_val_kd = float(ck["best_val_kd"])
 
-    if args.samples_per_epoch is not None and not args.coco:
-        ds.resample_epoch(start_epoch)
-    if args.coco:
-        loader = DataLoader(
-            ds,
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=args.num_workers,
-            collate_fn=collate_distill_coco_box,
-            pin_memory=device.type == "cuda",
-        )
-        val_ds = CocoTrain2017BoxPrompts(
-            images=args.coco_val_dir,
-            instances_json=args.coco_val_instances_json,
-            img_size=args.img_size,
-            seed=args.seed + 1337,
-            instances_per_image=1,
-        )
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            collate_fn=collate_distill_coco_box,
-            pin_memory=device.type == "cuda",
-        )
-    else:
-        loader = make_distill_loader(
-            ds,
-            args.batch_size,
-            args.num_workers,
-            device,
-            seed=args.seed,
-            epoch_index=start_epoch,
-        )
+    loader = DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        collate_fn=collate_distill_coco_box,
+        pin_memory=device.type == "cuda",
+    )
+    val_ds = CocoTrain2017BoxPrompts(
+        images=args.coco_val_dir,
+        instances_json=args.coco_val_instances_json,
+        img_size=args.img_size,
+        seed=args.seed + 1337,
+        instances_per_image=1,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_distill_coco_box,
+        pin_memory=device.type == "cuda",
+    )
 
     run_dir = _make_run_dir(args.output)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -408,18 +318,6 @@ def main() -> None:
     end_epoch = start_epoch + args.epochs
     try:
         for epoch in range(start_epoch, end_epoch):
-            # First epoch of this session uses ds/loader from resample_epoch(start_epoch) before the loop.
-            # Resampling here every epoch would discard that subset and break --profile-batch vs epoch 0 alignment.
-            if args.samples_per_epoch is not None and (not args.coco) and epoch > start_epoch:
-                ds.resample_epoch(epoch)
-                loader = make_distill_loader(
-                    ds,
-                    args.batch_size,
-                    args.num_workers,
-                    device,
-                    seed=args.seed,
-                    epoch_index=epoch,
-                )
             distill.train()
             pbar = tqdm(
                 loader,
@@ -434,15 +332,11 @@ def main() -> None:
             accum_count = 0
             opt.zero_grad(set_to_none=True)
             for batch in pbar:
-                if args.coco:
-                    imgs, boxes, _meta = batch
-                    imgs = imgs.to(device)
-                    boxes = boxes.to(device)
-                else:
-                    imgs, _paths = batch
-                    imgs = imgs.to(device)
+                imgs, boxes, _meta = batch
+                imgs = imgs.to(device)
+                boxes = boxes.to(device)
                 with autocast("cuda", enabled=use_amp):
-                    out = distill(imgs, boxes) if args.coco else distill(imgs)
+                    out = distill(imgs, boxes)
                 loss = out["loss"]
                 if scaler is not None:
                     scaler.scale(loss / accum).backward()
@@ -501,34 +395,33 @@ def main() -> None:
             writer.add_scalar("train/kl_epoch", m_kl, epoch + 1)
             writer.add_scalar("train/md_epoch", m_md, epoch + 1)
 
-        if args.coco:
-            val_kd, val_kl, val_md = validate_one_epoch_coco(val_loader, distill, device, use_amp=use_amp)
-            print(f"[val] kd={val_kd:.4f}  kl={val_kl:.4f}  md={val_md:.4f}  (best_kd={best_val_kd:.4f})")
-            writer.add_scalar("val/kd_epoch", val_kd, epoch + 1)
-            writer.add_scalar("val/kl_epoch", val_kl, epoch + 1)
-            writer.add_scalar("val/md_epoch", val_md, epoch + 1)
-            if val_kd < best_val_kd:
-                best_val_kd = val_kd
-                meta_best = {
-                    "img_size": args.img_size,
-                    "backbone_dim": rdl_cfg.backbone_dim,
-                    "backbone_depth": rdl_cfg.backbone_depth,
-                    "lite": int(args.lite),
-                    "epochs_done": epoch + 1,
-                    "seed": args.seed,
-                    "amp": use_amp,
-                    "dataset": "coco",
-                    "run_dir": str(run_dir),
-                    "note": "best by val KD",
-                    "step_unit": "update",
-                    "val_kd": float(val_kd),
-                    "val_kl": float(val_kl),
-                    "val_md": float(val_md),
-                }
-                best_state = distill_trainable_state_dict(distill, meta=meta_best)
-                best_state["best_val_kd"] = best_val_kd
-                torch.save(best_state, best_ckpt)
-                print(f"Saved best checkpoint -> {best_ckpt}")
+        val_kd, val_kl, val_md = validate_one_epoch_coco(val_loader, distill, device, use_amp=use_amp)
+        print(f"[val] kd={val_kd:.4f}  kl={val_kl:.4f}  md={val_md:.4f}  (best_kd={best_val_kd:.4f})")
+        writer.add_scalar("val/kd_epoch", val_kd, epoch + 1)
+        writer.add_scalar("val/kl_epoch", val_kl, epoch + 1)
+        writer.add_scalar("val/md_epoch", val_md, epoch + 1)
+        if val_kd < best_val_kd:
+            best_val_kd = val_kd
+            meta_best = {
+                "img_size": args.img_size,
+                "backbone_dim": rdl_cfg.backbone_dim,
+                "backbone_depth": rdl_cfg.backbone_depth,
+                "lite": int(args.lite),
+                "epochs_done": epoch + 1,
+                "seed": args.seed,
+                "amp": use_amp,
+                "dataset": "coco",
+                "run_dir": str(run_dir),
+                "note": "best by val KD",
+                "step_unit": "update",
+                "val_kd": float(val_kd),
+                "val_kl": float(val_kl),
+                "val_md": float(val_md),
+            }
+            best_state = distill_trainable_state_dict(distill, meta=meta_best)
+            best_state["best_val_kd"] = best_val_kd
+            torch.save(best_state, best_ckpt)
+            print(f"Saved best checkpoint -> {best_ckpt}")
 
         meta = {
             "img_size": args.img_size,
@@ -537,10 +430,9 @@ def main() -> None:
             "lite": int(args.lite),
             "epochs_done": epoch + 1,
             "grad_accum_steps": args.grad_accum_steps,
-            "samples_per_epoch": args.samples_per_epoch,
             "seed": args.seed,
             "amp": use_amp,
-            "dataset": "coco" if args.coco else "folder",
+            "dataset": "coco",
             "run_dir": str(run_dir),
             "step_unit": "update",
         }
