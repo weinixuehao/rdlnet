@@ -27,7 +27,7 @@ exec python train_distill.py \
   --coco-val-dir dataset/coco/val2017 \
   --coco-val-instances-json dataset/coco/annotations/instances_val2017.json \
   --teacher-checkpoint checkpoints/sam/sam_vit_h_4b8939.pth \
-  --output checkpoints/distill \
+  --output output/distill \
   --seed 42 \
   --epochs 1000 \
   --batch-size 1 \

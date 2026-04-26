@@ -482,6 +482,39 @@ class LightSAMMultiplexDistillationDecoderKD(nn.Module):
         loss = self.cfg.weight_kl * loss_kl + self.cfg.weight_md * loss_md
         return {"loss": loss, "loss_kl": loss_kl.detach(), "loss_md": loss_md.detach()}
 
+    @torch.no_grad()
+    def predict_low_res_logits(self, images: Tensor, boxes_xyxy: Tensor) -> Dict[str, Tensor]:
+        """
+        Return low-res mask logits for visualization/debug.
+
+        Returns:
+          - low_res_t: teacher low-res logits, shape [B, M, h, w]
+          - low_res_s: student low-res logits, shape [B, M, h, w]
+        """
+        x = sam_normalize_images(images)
+
+        emb_t = self.teacher_image_encoder(x)
+        sparse_t, dense_t = self.teacher_prompt_encoder(points=None, boxes=boxes_xyxy, masks=None)
+        low_res_t, _iou_t = self.teacher_mask_decoder(
+            image_embeddings=emb_t,
+            image_pe=self.teacher_prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse_t,
+            dense_prompt_embeddings=dense_t,
+            multimask_output=True,
+        )
+
+        emb_s = self.student_image_encoder(x)
+        sparse_s, dense_s = self.student_prompt_encoder(points=None, boxes=boxes_xyxy, masks=None)
+        low_res_s, _iou_s = self.student_mask_decoder(
+            image_embeddings=emb_s,
+            image_pe=self.student_prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse_s,
+            dense_prompt_embeddings=dense_s,
+            multimask_output=True,
+        )
+
+        return {"low_res_t": low_res_t, "low_res_s": low_res_s}
+
 
 def distill_trainable_state_dict(distill_mod: nn.Module, meta: Optional[Dict[str, object]] = None) -> Dict[str, object]:
     """

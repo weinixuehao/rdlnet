@@ -23,6 +23,7 @@ from datetime import datetime
 import torch
 import torch.nn as nn
 from torch.amp import autocast
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import MultiStepLR
@@ -64,6 +65,148 @@ def collate_distill_coco_box(batch):
     boxes = torch.stack([b[1] for b in batch], dim=0)  # [B,4]
     metas = [b[2] for b in batch]
     return imgs, boxes, metas
+
+
+def _chw_u8_hwc(images_chw: torch.Tensor):
+    import numpy as np
+
+    x = images_chw.detach().cpu()
+    if x.dtype != torch.uint8:
+        x = x.clamp(0, 255).to(torch.uint8)
+    return np.transpose(x.numpy(), (1, 2, 0))
+
+
+def _distill_vis_grid_u8(
+    images: torch.Tensor,
+    boxes_xyxy: torch.Tensor,
+    low_res_logits: torch.Tensor,
+    *,
+    title: str,
+    max_samples: int,
+    mask_alpha: float = 0.45,
+):
+    """
+    Build a visualization grid: [image+box | mask overlay].
+    Returns RGB uint8 (H, W, 3) as numpy.
+    """
+    import numpy as np
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    bsz = int(images.shape[0])
+    b = min(bsz, int(max_samples))
+    if b <= 0:
+        return np.zeros((1, 1, 3), dtype=np.uint8)
+
+    # pick a single mask per sample (max over multimask heads)
+    prob = low_res_logits.detach().float().sigmoid()
+    if prob.ndim == 4:
+        prob = prob.max(dim=1).values  # [B, h, w]
+
+    # upscale prob to image resolution
+    h_img = int(images.shape[-2])
+    w_img = int(images.shape[-1])
+    prob_up = F.interpolate(prob.unsqueeze(1), size=(h_img, w_img), mode="bilinear", align_corners=False).squeeze(1)
+
+    ncols = 2
+    fig, axes = plt.subplots(b, ncols, figsize=(4.6 * ncols, 3.8 * b), squeeze=False)
+    for i in range(b):
+        rgb = _chw_u8_hwc(images[i])
+        axes[i, 0].imshow(rgb)
+        axes[i, 0].set_title("image + box")
+        axes[i, 0].axis("off")
+
+        x1, y1, x2, y2 = [float(v) for v in boxes_xyxy[i].detach().cpu().tolist()]
+        rect = plt.Rectangle((x1, y1), max(0.0, x2 - x1), max(0.0, y2 - y1), fill=False, linewidth=2.0, edgecolor="lime")
+        axes[i, 0].add_patch(rect)
+
+        axes[i, 1].imshow(rgb)
+        axes[i, 1].imshow(prob_up[i].detach().cpu().numpy(), cmap="magma", alpha=float(mask_alpha), vmin=0.0, vmax=1.0)
+        axes[i, 1].set_title("mask overlay")
+        axes[i, 1].axis("off")
+
+    fig.suptitle(title, fontsize=11, y=1.02)
+    fig.tight_layout()
+    fig.canvas.draw()
+    # Matplotlib 3.8+ on Agg may not expose tostring_rgb(); use buffer_rgba() instead.
+    rgba = np.asarray(fig.canvas.buffer_rgba())  # [H, W, 4] uint8
+    buf = rgba[..., :3].copy()
+    plt.close(fig)
+    return buf
+
+
+def _distill_vis_compare_grid_u8(
+    images: torch.Tensor,
+    boxes_xyxy: torch.Tensor,
+    low_res_t: torch.Tensor,
+    low_res_s: torch.Tensor,
+    *,
+    title: str,
+    max_samples: int,
+    mask_alpha: float = 0.45,
+):
+    """
+    Build a comparison grid: [image+box | teacher overlay | student overlay].
+    Returns RGB uint8 (H, W, 3) as numpy.
+    """
+    import numpy as np
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    bsz = int(images.shape[0])
+    b = min(bsz, int(max_samples))
+    if b <= 0:
+        return np.zeros((1, 1, 3), dtype=np.uint8)
+
+    def _prob_up(low_res_logits: torch.Tensor) -> torch.Tensor:
+        prob = low_res_logits.detach().float().sigmoid()
+        if prob.ndim == 4:
+            prob = prob.max(dim=1).values  # [B, h, w]
+        h_img = int(images.shape[-2])
+        w_img = int(images.shape[-1])
+        return (
+            F.interpolate(prob.unsqueeze(1), size=(h_img, w_img), mode="bilinear", align_corners=False)
+            .squeeze(1)
+            .clamp(0.0, 1.0)
+        )
+
+    t_up = _prob_up(low_res_t)
+    s_up = _prob_up(low_res_s)
+
+    ncols = 3
+    fig, axes = plt.subplots(b, ncols, figsize=(4.6 * ncols, 3.8 * b), squeeze=False)
+    for i in range(b):
+        rgb = _chw_u8_hwc(images[i])
+        x1, y1, x2, y2 = [float(v) for v in boxes_xyxy[i].detach().cpu().tolist()]
+        rect = plt.Rectangle((x1, y1), max(0.0, x2 - x1), max(0.0, y2 - y1), fill=False, linewidth=2.0, edgecolor="lime")
+
+        axes[i, 0].imshow(rgb)
+        axes[i, 0].add_patch(rect)
+        axes[i, 0].set_title("image + box")
+        axes[i, 0].axis("off")
+
+        axes[i, 1].imshow(rgb)
+        axes[i, 1].imshow(t_up[i].detach().cpu().numpy(), cmap="magma", alpha=float(mask_alpha), vmin=0.0, vmax=1.0)
+        axes[i, 1].set_title("teacher mask")
+        axes[i, 1].axis("off")
+
+        axes[i, 2].imshow(rgb)
+        axes[i, 2].imshow(s_up[i].detach().cpu().numpy(), cmap="magma", alpha=float(mask_alpha), vmin=0.0, vmax=1.0)
+        axes[i, 2].set_title("student mask")
+        axes[i, 2].axis("off")
+
+    fig.suptitle(title, fontsize=11, y=1.02)
+    fig.tight_layout()
+    fig.canvas.draw()
+    # Matplotlib 3.8+ on Agg may not expose tostring_rgb(); use buffer_rgba() instead.
+    rgba = np.asarray(fig.canvas.buffer_rgba())  # [H, W, 4] uint8
+    buf = rgba[..., :3].copy()
+    plt.close(fig)
+    return buf
 
 
 @torch.no_grad()
@@ -133,6 +276,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=4.0,
         help="Gradient clipping max norm. Set to 0 to disable.",
+    )
+    p.add_argument(
+        "--tb-vis-interval",
+        type=int,
+        default=200,
+        help="TensorBoard mask visualization interval in optimizer steps (0 disables).",
+    )
+    p.add_argument(
+        "--tb-vis-max-samples",
+        type=int,
+        default=4,
+        help="Max samples (rows) per TensorBoard visualization grid.",
     )
     p.add_argument(
         "--seed",
@@ -364,6 +519,25 @@ def main() -> None:
                             writer.add_scalar("train/lr", lr, global_step)
                         except Exception:
                             pass
+                        if args.tb_vis_interval and args.tb_vis_interval > 0 and (global_step % int(args.tb_vis_interval) == 0):
+                            distill.eval()
+                            with torch.no_grad():
+                                vis = distill.predict_low_res_logits(imgs, boxes)
+                            grid = _distill_vis_compare_grid_u8(
+                                imgs.detach().cpu(),
+                                boxes.detach().cpu(),
+                                vis["low_res_t"].detach().cpu(),
+                                vis["low_res_s"].detach().cpu(),
+                                title=f"train masks (epoch {epoch + 1}, step {global_step})",
+                                max_samples=int(args.tb_vis_max_samples),
+                            )
+                            writer.add_image(
+                                f"train/masks/compare/step_{global_step:08d}",
+                                grid.transpose(2, 0, 1),
+                                global_step=global_step,
+                                dataformats="CHW",
+                            )
+                            distill.train()
 
         if accum_count > 0:
             scale = accum / accum_count
@@ -397,6 +571,33 @@ def main() -> None:
         writer.add_scalar("val/kd_epoch", val_kd, epoch + 1)
         writer.add_scalar("val/kl_epoch", val_kl, epoch + 1)
         writer.add_scalar("val/md_epoch", val_md, epoch + 1)
+        if args.tb_vis_max_samples and int(args.tb_vis_max_samples) > 0:
+            distill.eval()
+            try:
+                vb = next(iter(val_loader))
+                vimgs, vboxes, _vmeta = vb
+                vimgs = vimgs.to(device)
+                vboxes = vboxes.to(device)
+                with torch.no_grad():
+                    vis = distill.predict_low_res_logits(vimgs, vboxes)
+                grid = _distill_vis_compare_grid_u8(
+                    vimgs.detach().cpu(),
+                    vboxes.detach().cpu(),
+                    vis["low_res_t"].detach().cpu(),
+                    vis["low_res_s"].detach().cpu(),
+                    title=f"val masks (epoch {epoch + 1})",
+                    max_samples=int(args.tb_vis_max_samples),
+                )
+                writer.add_image(
+                    f"val/masks/compare/epoch_{epoch + 1:04d}",
+                    grid.transpose(2, 0, 1),
+                    global_step=epoch + 1,
+                    dataformats="CHW",
+                )
+            except Exception as e:
+                print(f"Warning: failed to log val mask visualization: {e}")
+            finally:
+                distill.train()
         if val_kd < best_val_kd:
             best_val_kd = val_kd
             meta_best = {
