@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -22,6 +23,7 @@ namespace {
 struct Args {
   std::string model_path;
   std::string image_path;
+  std::string vis_out;
   int img_size = 1024;
   std::string input_range = "0_1";  // 0_1 | 0_255
   int doc_class_id = 0;
@@ -44,6 +46,8 @@ static Args parse_args(int argc, char** argv) {
       a.model_path = need("--model");
     } else if (k == "--image") {
       a.image_path = need("--image");
+    } else if (k == "--vis-out") {
+      a.vis_out = need("--vis-out");
     } else if (k == "--img-size") {
       a.img_size = std::stoi(need("--img-size"));
     } else if (k == "--input-range") {
@@ -54,7 +58,7 @@ static Args parse_args(int argc, char** argv) {
       std::cout
           << "Usage:\n"
           << "  rdlnet_tflite_infer --model rdlnet_points.tflite --image test.jpg \\\n"
-          << "    [--img-size 1024] [--input-range 0_1|0_255] [--doc-class-id 0]\n\n"
+          << "    --vis-out out.png [--img-size 1024] [--input-range 0_1|0_255] [--doc-class-id 0]\n\n"
           << "Notes:\n"
           << "  - If you exported with scripts/export_rdlnet_tflite.py, SAM mean/std normalization\n"
           << "    is already inside the model graph.\n"
@@ -66,6 +70,7 @@ static Args parse_args(int argc, char** argv) {
   }
   if (a.model_path.empty()) die("Missing --model");
   if (a.image_path.empty()) die("Missing --image");
+  if (a.vis_out.empty()) die("Missing --vis-out");
   if (!(a.input_range == "0_1" || a.input_range == "0_255")) die("--input-range must be 0_1 or 0_255");
   return a;
 }
@@ -274,6 +279,16 @@ static std::string dims_to_string(const TfLiteTensor* t) {
   return oss.str();
 }
 
+static cv::Mat load_rgb_resized_u8_with_opencv(const std::string& path, int img_size) {
+  cv::Mat bgr = cv::imread(path, cv::IMREAD_COLOR);
+  if (bgr.empty()) die("Failed to read image: " + path);
+  cv::Mat rgb;
+  cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
+  cv::Mat resized;
+  cv::resize(rgb, resized, cv::Size(img_size, img_size), 0, 0, cv::INTER_LINEAR);
+  return resized;  // uint8 RGB
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -319,9 +334,16 @@ int main(int argc, char** argv) {
   // Export script returns:
   // - points mode: (pred_logits, pred_points)
   // - full mode:   (pred_logits, pred_masks, pred_points)
-  const auto& outs = interp->outputs();
+  auto outs = interp->outputs();
   if (!(outs.size() == 2 || outs.size() == 3)) {
     die("Unexpected output tensor count (expected 2 or 3), got " + std::to_string(outs.size()));
+  }
+
+  // TFLite does not guarantee output tensor ordering. In points mode (2 outputs),
+  // `pred_points` has last dim 2P (even), while `pred_logits` has last dim C.
+  if (outs.size() == 2) {
+    auto lastdim = [&](int oi) -> int { return interp->tensor(oi)->dims->data[2]; };
+    if (lastdim(outs[0]) % 2 == 0) std::swap(outs[0], outs[1]);
   }
 
   const TfLiteTensor* t0 = interp->tensor(outs[0]);
@@ -395,6 +417,39 @@ int main(int argc, char** argv) {
     float x = qpts[i * 2 + 0] * static_cast<float>(W);
     float y = qpts[i * 2 + 1] * static_cast<float>(H);
     std::cout << "  p" << i << ": (" << x << ", " << y << ")\n";
+  }
+
+  // Visualize: draw polygon from first 4 points (trained points; others may be -1 padded).
+  if (!args.vis_out.empty()) {
+    cv::Mat vis_rgb = load_rgb_resized_u8_with_opencv(args.image_path, H);
+    std::vector<cv::Point> poly;
+    poly.reserve(4);
+    for (int i = 0; i < std::min(4, P); ++i) {
+      const float xn = qpts[i * 2 + 0];
+      const float yn = qpts[i * 2 + 1];
+      if (xn < 0.0f || yn < 0.0f) continue;  // padding
+      int px = static_cast<int>(std::lround(xn * static_cast<float>(W)));
+      int py = static_cast<int>(std::lround(yn * static_cast<float>(H)));
+      px = std::max(0, std::min(W - 1, px));
+      py = std::max(0, std::min(H - 1, py));
+      poly.emplace_back(px, py);
+      cv::circle(vis_rgb, cv::Point(px, py), 4, cv::Scalar(0, 255, 0), -1, cv::LINE_AA);
+    }
+    if (poly.size() >= 3) {
+      cv::polylines(vis_rgb, poly, true, cv::Scalar(255, 0, 0), 2, cv::LINE_AA);
+    }
+    cv::Mat vis_bgr;
+    cv::cvtColor(vis_rgb, vis_bgr, cv::COLOR_RGB2BGR);
+    {
+      std::error_code ec;
+      const std::filesystem::path out_p(args.vis_out);
+      const std::filesystem::path parent = out_p.parent_path();
+      if (!parent.empty()) std::filesystem::create_directories(parent, ec);
+    }
+    if (!cv::imwrite(args.vis_out, vis_bgr)) {
+      die("Failed to write vis image: " + args.vis_out + " (check parent dir exists and is writable)");
+    }
+    std::cout << "saved visualization -> " << args.vis_out << "\n";
   }
 
   return 0;
