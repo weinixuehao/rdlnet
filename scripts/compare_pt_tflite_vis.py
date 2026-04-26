@@ -27,26 +27,31 @@ def parse_args() -> argparse.Namespace:
 
 
 def _load_rgb_resized_u8(path: Path, img_size: int) -> np.ndarray:
-    from PIL import Image
+    import cv2
 
-    im = Image.open(path).convert("RGB")
-    w0, h0 = im.size
-    s = float(img_size) / float(max(int(w0), int(h0), 1))
+    bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise SystemExit(f"Failed to read image: {path}")
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    h0, w0 = int(rgb.shape[0]), int(rgb.shape[1])
+    s = float(img_size) / float(max(h0, w0))
     new_w = max(1, int(round(float(w0) * s)))
     new_h = max(1, int(round(float(h0) * s)))
     pad_x = int((img_size - new_w) // 2)
     pad_y = int((img_size - new_h) // 2)
-    im_r = im.resize((new_w, new_h), Image.BILINEAR)
-    canvas = Image.new("RGB", (img_size, img_size), (0, 0, 0))
-    canvas.paste(im_r, (pad_x, pad_y))
-    return np.asarray(canvas, dtype=np.uint8)
+    resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    canvas = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+    canvas[pad_y : pad_y + new_h, pad_x : pad_x + new_w, :] = resized
+    return canvas
 
 
 def _load_rgb_u8(path: Path) -> np.ndarray:
-    from PIL import Image
+    import cv2
 
-    im = Image.open(path).convert("RGB")
-    return np.asarray(im, dtype=np.uint8)
+    bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise SystemExit(f"Failed to read image: {path}")
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
 def _prep_input(rgb_u8: np.ndarray, *, input_range: str) -> np.ndarray:
