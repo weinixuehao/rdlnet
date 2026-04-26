@@ -7,10 +7,16 @@ This folder contains a minimal C++ program that runs inference on the exported `
 From repo root:
 
 ```bash
-./scripts/run_export_tflite.sh /path/to/rdlnet_best.pt ./output/_export_rdlnet 1024 points 0_1 1
+./.venv/bin/python scripts/export_rdlnet_tflite.py \
+  --ckpt /path/to/rdlnet_best.pt \
+  --out-dir ./output/_export_rdlnet \
+  --img-size 1024 \
+  --export points \
+  --input-range 0_1 \
+  --fp16
 ```
 
-The default export script enables `--use-sam-pixel-norm`, so **SAM mean/std normalization is already inside the model graph**.
+The export script always applies SAM mean/std normalization, so **SAM mean/std normalization is already inside the model graph**.
 That means the C++ side should just feed float32 RGB pixels in the chosen `--input-range` (`0_1` or `0_255`).
 
 `--fp16` uses float16 weight quantization. Typically **I/O stays float32**, but the demo also supports float16 I/O.

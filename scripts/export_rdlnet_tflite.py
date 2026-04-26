@@ -6,28 +6,24 @@ import os
 import sys
 from pathlib import Path
 from dataclasses import fields
-from rdlnet.model import RDLNetConfig, apply_lite_preset
 
 _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
+from rdlnet.model import RDLNetConfig, apply_lite_preset
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Export RDLNet .pt checkpoint to TFLite via LiteRT Torch")
     p.add_argument("--ckpt", type=str, required=True, help="Path to train_rdlnet checkpoint (.pt)")
-    p.add_argument("--out-dir", type=str, default="export", help="Output directory")
+    p.add_argument("--out-dir", type=str, required=True, help="Output directory")
     p.add_argument("--img-size", type=int, default=1024, help="Model input size (H=W)")
     p.add_argument(
         "--num-classes",
         type=int,
         default=None,
         help="Number of foreground classes (not counting background). If omitted, try ckpt['config']['num_classes'], else 2.",
-    )
-    p.add_argument(
-        "--use-sam-pixel-norm",
-        action="store_true",
-        help="Apply SAM pixel mean/std normalization (fixed, export-friendly preprocessing; no data-dependent branches).",
     )
     p.add_argument(
         "--input-range",
@@ -178,7 +174,7 @@ def main() -> None:
         out_dir=out_dir,
         img_size=int(args.img_size),
         num_classes=args.num_classes,
-        use_sam_pixel_norm=bool(args.use_sam_pixel_norm),
+        use_sam_pixel_norm=True,
         input_range=str(args.input_range),
         batch=int(args.batch),
         export=str(args.export),

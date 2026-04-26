@@ -56,7 +56,7 @@ static Args parse_args(int argc, char** argv) {
           << "  rdlnet_tflite_infer --model rdlnet_points.tflite --image test.jpg \\\n"
           << "    [--img-size 1024] [--input-range 0_1|0_255] [--doc-class-id 0]\n\n"
           << "Notes:\n"
-          << "  - If you exported with scripts/run_export_tflite.sh, preprocessing (SAM mean/std)\n"
+          << "  - If you exported with scripts/export_rdlnet_tflite.py, SAM mean/std normalization\n"
           << "    is already inside the model graph.\n"
           << "  - Export with --fp16 usually keeps I/O as float32; this demo also supports float16 I/O.\n";
       std::exit(0);
