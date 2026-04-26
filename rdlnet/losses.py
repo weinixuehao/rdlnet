@@ -13,13 +13,43 @@ from .hungarian import linear_sum_assignment
 from .model import RDLNetConfig
 
 
-def dice_loss(pred: Tensor, target: Tensor, eps: float = 1e-6) -> Tensor:
+def dice_loss(pred: Tensor, target: Tensor, eps: float = 1e-6, *, valid_mask: Tensor | None = None) -> Tensor:
     """Eq. (9), averaged over spatial dims; pred/target [B, Nq, H, W] in [0,1]."""
-    p = pred.flatten(2)
-    t = target.flatten(2)
+    if valid_mask is None:
+        p = pred.flatten(2)
+        t = target.flatten(2)
+        num = 2 * (p * t).sum(-1)
+        den = p.sum(-1) + t.sum(-1) + eps
+        return (1 - num / den).mean()
+    # valid_mask: [B, H, W] bool (True=valid). Apply same mask to all queries.
+    if valid_mask.dtype != torch.bool or valid_mask.ndim != 3:
+        raise ValueError(f"valid_mask must be bool [B,H,W], got {valid_mask.dtype} {tuple(valid_mask.shape)}")
+    vm = valid_mask[:, None, :, :].to(device=pred.device)
+    p = (pred * vm).flatten(2)
+    t = (target * vm).flatten(2)
     num = 2 * (p * t).sum(-1)
     den = p.sum(-1) + t.sum(-1) + eps
     return (1 - num / den).mean()
+
+
+def masked_bce_with_logits(pred_logits: Tensor, target: Tensor, *, valid_mask: Tensor, eps: float = 1e-6) -> Tensor:
+    """
+    BCEWithLogits averaged over valid pixels only.
+    pred_logits/target: [B, Nq, H, W] or [Nq, H, W] if B is sliced out.
+    valid_mask: [B, H, W] or [H, W] bool, True=valid.
+    """
+    loss = F.binary_cross_entropy_with_logits(pred_logits, target, reduction="none")
+    if valid_mask.dtype != torch.bool:
+        raise TypeError("valid_mask must be bool")
+    if loss.ndim == 4:
+        vm = valid_mask[:, None, :, :].to(device=loss.device, dtype=loss.dtype)
+    elif loss.ndim == 3:
+        vm = valid_mask[None, :, :].to(device=loss.device, dtype=loss.dtype)
+    else:
+        raise ValueError(f"Unexpected pred_logits/target ndim: {loss.ndim}")
+    num = (loss * vm).sum()
+    den = vm.sum().clamp_min(eps)
+    return num / den
 
 
 def _points_valid_mask_from_padding(tp: Tensor) -> Tensor:
@@ -69,6 +99,8 @@ class HungarianMatcher(nn.Module):
         tgt_labels: List[Tensor],
         tgt_masks: List[Tensor],
         tgt_points: List[Tensor],
+        *,
+        valid_masks: List[Tensor] | None = None,
     ) -> List[Tuple[Tensor, Tensor]]:
         """
         pred_*: batched predictions [B, Nq, ...].
@@ -79,6 +111,9 @@ class HungarianMatcher(nn.Module):
         out: List[Tuple[Tensor, Tensor]] = []
         prob = pred_logits.softmax(-1)
 
+        if valid_masks is not None and len(valid_masks) != b:
+            raise ValueError(f"valid_masks length must match batch (got {len(valid_masks)} vs B={b})")
+
         for i in range(b):
             if tgt_labels[i].numel() == 0:
                 empty = torch.tensor([], dtype=torch.long, device=pred_logits.device)
@@ -88,6 +123,7 @@ class HungarianMatcher(nn.Module):
             tl = tgt_labels[i]
             tm = tgt_masks[i].float()
             tp = tgt_points[i]
+            vm = valid_masks[i].to(device=pred_logits.device) if valid_masks is not None else None
 
             # classification cost [Nq, Nt]
             cost_c = -prob[i][:, tl]
@@ -96,10 +132,20 @@ class HungarianMatcher(nn.Module):
                 pm = F.interpolate(pred_masks[i : i + 1], size=tm.shape[-2:], mode="bilinear", align_corners=False)[0]
             else:
                 pm = pred_masks[i]
-            # torch.cdist CUDA does not support bfloat16; compute mask cost in fp32.
             pm = pm.sigmoid().float()
             tm_f = tm.float()
-            cost_m = torch.cdist(pm.flatten(1), tm_f.flatten(1), p=1) / (tm.shape[-1] * tm.shape[-2])
+            if vm is None:
+                cost_m = torch.cdist(pm.flatten(1), tm_f.flatten(1), p=1) / (tm.shape[-1] * tm.shape[-2])
+            else:
+                # Mask out padding: L1 averaged over valid pixels only.
+                if vm.dtype != torch.bool or vm.ndim != 2:
+                    raise ValueError(f"valid_masks[{i}] must be bool [H,W], got {vm.dtype} {tuple(vm.shape)}")
+                if vm.shape != tm_f.shape[-2:]:
+                    vm = F.interpolate(vm[None, None].float(), size=tm_f.shape[-2:], mode="nearest").squeeze(0).squeeze(0) > 0.5
+                w = vm.to(device=pm.device, dtype=pm.dtype)  # [H,W]
+                diff = (pm[:, None, :, :] - tm_f[None, :, :, :]).abs() * w[None, None, :, :]
+                den = w.sum().clamp_min(1.0)
+                cost_m = diff.flatten(2).sum(-1) / den  # [Nq,Nt]
 
             # point L1 cost [Nq, Nt]
             m = _points_valid_mask_from_padding(tp)
@@ -141,19 +187,26 @@ class RDLNetLoss(nn.Module):
         tgt_labels: List[Tensor],
         tgt_masks: List[Tensor],
         tgt_points: List[Tensor],
+        *,
+        valid_masks: List[Tensor] | None = None,
     ) -> Tuple[Tensor, Dict[str, Tensor]]:
         """``tgt_*`` must live on the same device as ``pred_logits`` (e.g. moved in the training loop)."""
         b, nq, _ = pred_logits.shape
         device = pred_logits.device
         self.empty_weight = self.empty_weight.to(device)
 
-        indices = self.matcher(pred_logits, pred_masks, pred_points, tgt_labels, tgt_masks, tgt_points)
+        indices = self.matcher(
+            pred_logits, pred_masks, pred_points, tgt_labels, tgt_masks, tgt_points, valid_masks=valid_masks
+        )
 
         loss_cls = torch.zeros(1, device=device)
         loss_mask = torch.zeros(1, device=device)
         loss_dice = torch.zeros(1, device=device)
         loss_dist = torch.zeros(1, device=device)
         n_inst = 0
+
+        if valid_masks is not None and len(valid_masks) != b:
+            raise ValueError(f"valid_masks length must match batch (got {len(valid_masks)} vs B={b})")
 
         for i, (src_i, tgt_i) in enumerate(indices):
             if tgt_i.numel() == 0:
@@ -172,8 +225,17 @@ class RDLNetLoss(nn.Module):
             if pm.shape[-2:] != tm.shape[-2:]:
                 tm = F.interpolate(tm.unsqueeze(1), size=pm.shape[-2:], mode="nearest").squeeze(1)
             pm_sig = pm.sigmoid()
-            loss_mask = loss_mask + F.binary_cross_entropy_with_logits(pm, tm)
-            loss_dice = loss_dice + dice_loss(pm_sig, tm)
+            vm = valid_masks[i].to(device=device) if valid_masks is not None else None
+            if vm is None:
+                loss_mask = loss_mask + F.binary_cross_entropy_with_logits(pm, tm)
+                loss_dice = loss_dice + dice_loss(pm_sig, tm)
+            else:
+                if vm.dtype != torch.bool or vm.ndim != 2:
+                    raise ValueError(f"valid_masks[{i}] must be bool [H,W], got {vm.dtype} {tuple(vm.shape)}")
+                if vm.shape != tm.shape[-2:]:
+                    vm = F.interpolate(vm[None, None].float(), size=tm.shape[-2:], mode="nearest").squeeze(0).squeeze(0) > 0.5
+                loss_mask = loss_mask + masked_bce_with_logits(pm, tm, valid_mask=vm)
+                loss_dice = loss_dice + dice_loss(pm_sig, tm, valid_mask=vm[None, :, :])
 
             pp = pred_points[i][src_i]
             tp = tgt_points[i][tgt_i]

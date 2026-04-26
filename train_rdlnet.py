@@ -128,12 +128,20 @@ def load_loss_history_from_ck(ck: dict) -> tuple[list[int], list[float], list[fl
     return ep[:n], lo[:n], lc[:n], ld[:n], ldi[:n], lm[:n]
 
 
-def _batch_to_device(batch: dict[str, Any], device: torch.device) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+def _batch_to_device(
+    batch: dict[str, Any], device: torch.device
+) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], torch.Tensor]:
     images = batch["images"].to(device)
     tgt_labels = [t.to(device) for t in batch["tgt_labels"]]
     tgt_masks = [t.to(device) for t in batch["tgt_masks"]]
     tgt_points = [t.to(device) for t in batch["tgt_points"]]
-    return images, tgt_labels, tgt_masks, tgt_points
+    valid_masks = batch.get("valid_masks")
+    if valid_masks is None:
+        # Backward compatible: treat whole image as valid.
+        b, _, h, w = images.shape
+        valid_masks = torch.ones(b, h, w, dtype=torch.bool)
+    valid_masks = valid_masks.to(device=device)
+    return images, tgt_labels, tgt_masks, tgt_points, valid_masks
 
 
 def _forward_and_loss(
@@ -143,13 +151,14 @@ def _forward_and_loss(
     tgt_labels: list[torch.Tensor],
     tgt_masks: list[torch.Tensor],
     tgt_points: list[torch.Tensor],
+    valid_masks: torch.Tensor,
     *,
     device_type: str,
     use_amp: bool,
     amp_dtype: torch.dtype,
 ) -> tuple[dict[str, torch.Tensor], torch.Tensor, dict[str, torch.Tensor]]:
     with torch.amp.autocast(device_type=device_type, enabled=use_amp, dtype=amp_dtype):
-        out = model(images)
+        out = model(images, valid_mask=valid_masks)
         loss, logs = criterion(
             out["pred_logits"],
             out["pred_masks"],
@@ -157,6 +166,7 @@ def _forward_and_loss(
             tgt_labels,
             tgt_masks,
             tgt_points,
+            valid_masks=[m for m in valid_masks],
         )
     return out, loss, logs
 
@@ -168,6 +178,7 @@ def _log_compare_grid_to_tb(
     tgt_labels: list[torch.Tensor],
     tgt_masks: list[torch.Tensor],
     tgt_points: list[torch.Tensor],
+    valid_masks: torch.Tensor,
     *,
     tag: str,
     global_step: int,
@@ -509,7 +520,7 @@ def main() -> None:
             n_plan = len(loader) if max_batches <= 0 else min(len(loader), max_batches)
             micro = 0
             for bi, batch in enumerate(tqdm(loader, desc=f"epoch {epoch + 1}/{end_epoch}", leave=True)):
-                images, tgt_labels, tgt_masks, tgt_points = _batch_to_device(batch, device)
+                images, tgt_labels, tgt_masks, tgt_points, valid_masks = _batch_to_device(batch, device)
                 is_last_in_epoch = (bi + 1) == n_plan
                 if micro == 0:
                     opt.zero_grad(set_to_none=True)
@@ -520,6 +531,7 @@ def main() -> None:
                     tgt_labels,
                     tgt_masks,
                     tgt_points,
+                    valid_masks,
                     device_type=device.type,
                     use_amp=use_amp,
                     amp_dtype=amp_dtype,
@@ -571,6 +583,7 @@ def main() -> None:
                             tgt_labels,
                             tgt_masks,
                             tgt_points,
+                            valid_masks,
                             tag=f"train/compare_grid/epoch_{epoch + 1:04d}/step_{optimizer_step:08d}",
                             global_step=optimizer_step,
                             max_samples=args.viz_samples,
@@ -612,7 +625,7 @@ def main() -> None:
                 with torch.no_grad():
                     for vbi, batch in enumerate(tqdm(val_loader, desc=f"val {epoch + 1}/{end_epoch}", leave=False)):
                         paths = batch.get("paths") or []
-                        images, tgt_labels, tgt_masks, tgt_points = _batch_to_device(batch, device)
+                        images, tgt_labels, tgt_masks, tgt_points, valid_masks = _batch_to_device(batch, device)
                         out, loss, logs = _forward_and_loss(
                             model,
                             criterion,
@@ -620,6 +633,7 @@ def main() -> None:
                             tgt_labels,
                             tgt_masks,
                             tgt_points,
+                            valid_masks,
                             device_type=device.type,
                             use_amp=use_amp,
                             amp_dtype=amp_dtype,
@@ -635,6 +649,7 @@ def main() -> None:
                                 tgt_labels,
                                 tgt_masks,
                                 tgt_points,
+                                valid_masks,
                                 tag=f"val/compare_grid/epoch_{ep_no:04d}/batch_{vbi:04d}",
                                 global_step=ep_no,
                                 max_samples=args.viz_samples,

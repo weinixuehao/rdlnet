@@ -286,10 +286,13 @@ class RDLNet(nn.Module):
         ref_stacked = ref_cat.unsqueeze(1).expand(-1, self.cfg.num_feature_levels, -1)
         return ref_stacked.unsqueeze(0).expand(batch, -1, -1, -1)
 
-    def forward(self, images: Tensor) -> Dict[str, Tensor]:
+    def forward(self, images: Tensor, *, valid_mask: Optional[Tensor] = None) -> Dict[str, Tensor]:
         """
         Args:
             images: [B, 3, H, W], typically 1024×1024.
+            valid_mask: optional [B, H, W] bool tensor where True indicates valid (non-padding)
+                pixels in the input image frame. If provided, padding tokens are masked out in
+                deformable attention via `value_mask`.
         Returns:
             dict with pred_logits, pred_masks, pred_points, prior_mask_logits, aux_decoder_masks
         """
@@ -316,6 +319,22 @@ class RDLNet(nn.Module):
 
         pos2d = self.enc_pos_head(src)
         value_mask = None
+        if valid_mask is not None:
+            if valid_mask.dtype != torch.bool:
+                raise TypeError(f"valid_mask must be bool, got {valid_mask.dtype}")
+            if valid_mask.ndim != 3 or int(valid_mask.shape[0]) != b:
+                raise ValueError(f"valid_mask must have shape [B,H,W], got {tuple(valid_mask.shape)}")
+            if int(valid_mask.shape[1]) != gh or int(valid_mask.shape[2]) != gw:
+                raise ValueError(
+                    f"valid_mask spatial dims must match images (H,W)=({gh},{gw}), got ({valid_mask.shape[1]},{valid_mask.shape[2]})"
+                )
+            vm = valid_mask.to(device=images.device)
+            vm_levels: List[Tensor] = []
+            # Map pixel-level valid mask to each feature level resolution.
+            for (hi, wi) in spatial_shapes:
+                m = F.interpolate(vm.float().unsqueeze(1), size=(int(hi), int(wi)), mode="nearest").squeeze(1)
+                vm_levels.append(m > 0.5)
+            value_mask = torch.cat([m.flatten(1) for m in vm_levels], dim=1)  # [B, sum(HW)] bool True=valid
 
         x = src
         for layer in self.encoder_layers:

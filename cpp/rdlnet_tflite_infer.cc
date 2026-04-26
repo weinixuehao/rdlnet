@@ -211,11 +211,22 @@ static std::vector<float> load_rgb_resized_hwc_f32_with_opencv(
   cv::Mat rgb;
   cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
 
+  // Letterbox: keep aspect, then pad to img_size×img_size.
+  const int h0 = rgb.rows;
+  const int w0 = rgb.cols;
+  const float s = static_cast<float>(img_size) / static_cast<float>(std::max(h0, w0));
+  const int new_w = std::max(1, static_cast<int>(std::lround(static_cast<float>(w0) * s)));
+  const int new_h = std::max(1, static_cast<int>(std::lround(static_cast<float>(h0) * s)));
+  const int pad_x = (img_size - new_w) / 2;
+  const int pad_y = (img_size - new_h) / 2;
+
   cv::Mat resized;
-  cv::resize(rgb, resized, cv::Size(img_size, img_size), 0, 0, cv::INTER_LINEAR);
+  cv::resize(rgb, resized, cv::Size(new_w, new_h), 0, 0, cv::INTER_LINEAR);
+  cv::Mat canvas(img_size, img_size, resized.type(), cv::Scalar(0, 0, 0));
+  resized.copyTo(canvas(cv::Rect(pad_x, pad_y, new_w, new_h)));
 
   cv::Mat f32;
-  resized.convertTo(f32, CV_32FC3);
+  canvas.convertTo(f32, CV_32FC3);
   if (input_range == "0_1") {
     f32 *= (1.0f / 255.0f);
   }
@@ -284,9 +295,26 @@ static cv::Mat load_rgb_resized_u8_with_opencv(const std::string& path, int img_
   if (bgr.empty()) die("Failed to read image: " + path);
   cv::Mat rgb;
   cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
+  const int h0 = rgb.rows;
+  const int w0 = rgb.cols;
+  const float s = static_cast<float>(img_size) / static_cast<float>(std::max(h0, w0));
+  const int new_w = std::max(1, static_cast<int>(std::lround(static_cast<float>(w0) * s)));
+  const int new_h = std::max(1, static_cast<int>(std::lround(static_cast<float>(h0) * s)));
+  const int pad_x = (img_size - new_w) / 2;
+  const int pad_y = (img_size - new_h) / 2;
   cv::Mat resized;
-  cv::resize(rgb, resized, cv::Size(img_size, img_size), 0, 0, cv::INTER_LINEAR);
-  return resized;  // uint8 RGB
+  cv::resize(rgb, resized, cv::Size(new_w, new_h), 0, 0, cv::INTER_LINEAR);
+  cv::Mat canvas(img_size, img_size, resized.type(), cv::Scalar(0, 0, 0));
+  resized.copyTo(canvas(cv::Rect(pad_x, pad_y, new_w, new_h)));
+  return canvas;  // uint8 RGB
+}
+
+static cv::Mat load_rgb_u8_with_opencv(const std::string& path) {
+  cv::Mat bgr = cv::imread(path, cv::IMREAD_COLOR);
+  if (bgr.empty()) die("Failed to read image: " + path);
+  cv::Mat rgb;
+  cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
+  return rgb;
 }
 
 }  // namespace
@@ -319,6 +347,16 @@ int main(int argc, char** argv) {
 
   std::vector<float> img_hwc_f32;
   img_hwc_f32 = load_rgb_resized_hwc_f32_with_opencv(args.image_path, H, args.input_range);
+
+  // Also compute letterbox params for inverse mapping back to original image coords.
+  cv::Mat orig_rgb_u8 = load_rgb_u8_with_opencv(args.image_path);
+  const int orig_h = orig_rgb_u8.rows;
+  const int orig_w = orig_rgb_u8.cols;
+  const float s = static_cast<float>(H) / static_cast<float>(std::max(orig_h, orig_w));
+  const int new_w = std::max(1, static_cast<int>(std::lround(static_cast<float>(orig_w) * s)));
+  const int new_h = std::max(1, static_cast<int>(std::lround(static_cast<float>(orig_h) * s)));
+  const int pad_x = (H - new_w) / 2;
+  const int pad_y = (H - new_h) / 2;
 
   if (in->type == kTfLiteFloat32) {
     float* in_data = interp->typed_tensor<float>(in_idx);
@@ -412,26 +450,44 @@ int main(int argc, char** argv) {
     std::cout << "  p" << i << ": (" << x << ", " << y << ")\n";
   }
 
-  std::cout << "points (pixels in resized image " << W << "x" << H << "):\n";
+  std::cout << "points (pixels in letterbox canvas " << W << "x" << H << "):\n";
   for (int i = 0; i < P; ++i) {
     float x = qpts[i * 2 + 0] * static_cast<float>(W);
     float y = qpts[i * 2 + 1] * static_cast<float>(H);
     std::cout << "  p" << i << ": (" << x << ", " << y << ")\n";
   }
 
-  // Visualize: draw polygon from first 4 points (trained points; others may be -1 padded).
+  std::cout << "points (pixels in original image " << orig_w << "x" << orig_h << "):\n";
+  for (int i = 0; i < P; ++i) {
+    float xn = qpts[i * 2 + 0];
+    float yn = qpts[i * 2 + 1];
+    if (xn < 0.0f || yn < 0.0f) continue;
+    // normalized -> canvas pixels
+    const float px = xn * static_cast<float>(W);
+    const float py = yn * static_cast<float>(H);
+    // inverse letterbox
+    const float ox = (px - static_cast<float>(pad_x)) / s;
+    const float oy = (py - static_cast<float>(pad_y)) / s;
+    std::cout << "  p" << i << ": (" << ox << ", " << oy << ")\n";
+  }
+
+  // Visualize: draw polygon from first 4 points on the ORIGINAL image (trained points; others may be -1 padded).
   if (!args.vis_out.empty()) {
-    cv::Mat vis_rgb = load_rgb_resized_u8_with_opencv(args.image_path, H);
+    cv::Mat vis_rgb = orig_rgb_u8.clone();
     std::vector<cv::Point> poly;
     poly.reserve(4);
     for (int i = 0; i < std::min(4, P); ++i) {
       const float xn = qpts[i * 2 + 0];
       const float yn = qpts[i * 2 + 1];
       if (xn < 0.0f || yn < 0.0f) continue;  // padding
-      int px = static_cast<int>(std::lround(xn * static_cast<float>(W)));
-      int py = static_cast<int>(std::lround(yn * static_cast<float>(H)));
-      px = std::max(0, std::min(W - 1, px));
-      py = std::max(0, std::min(H - 1, py));
+      const float cx = xn * static_cast<float>(W);
+      const float cy = yn * static_cast<float>(H);
+      const float ox = (cx - static_cast<float>(pad_x)) / s;
+      const float oy = (cy - static_cast<float>(pad_y)) / s;
+      int px = static_cast<int>(std::lround(ox));
+      int py = static_cast<int>(std::lround(oy));
+      px = std::max(0, std::min(orig_w - 1, px));
+      py = std::max(0, std::min(orig_h - 1, py));
       poly.emplace_back(px, py);
       cv::circle(vis_rgb, cv::Point(px, py), 4, cv::Scalar(0, 255, 0), -1, cv::LINE_AA);
     }

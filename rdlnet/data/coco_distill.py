@@ -122,9 +122,17 @@ class CocoTrain2017BoxPrompts(Dataset):
         p = self.images / file_name
         im = Image.open(p).convert("RGB")
 
-        # resize to square (simple, deterministic; keeps SAM normalization convention)
-        im_resized = im.resize((self.img_size, self.img_size), Image.BICUBIC)
-        arr = np.asarray(im_resized).copy()  # H,W,3 uint8
+        # Letterbox to square: keep aspect, then pad to img_size×img_size.
+        # This matches SAM-style preprocessing (resize longest side then pad) and avoids distortion.
+        s = float(self.img_size) / float(max(int(w0), int(h0), 1))
+        new_w = max(1, int(round(float(w0) * s)))
+        new_h = max(1, int(round(float(h0) * s)))
+        pad_x = int((self.img_size - new_w) // 2)
+        pad_y = int((self.img_size - new_h) // 2)
+        im_r = im.resize((new_w, new_h), Image.BICUBIC)
+        canvas = Image.new("RGB", (self.img_size, self.img_size), (0, 0, 0))
+        canvas.paste(im_r, (pad_x, pad_y))
+        arr = np.asarray(canvas).copy()  # H,W,3 uint8
         t = torch.from_numpy(arr).float().permute(2, 0, 1).contiguous()  # 3,H,W in 0–255
 
         # sample box(es) from this image
@@ -132,16 +140,14 @@ class CocoTrain2017BoxPrompts(Dataset):
         rng = self._rng_for_index(idx)
         chosen = [boxes[rng.randrange(len(boxes))] for _ in range(self.instances_per_image)]
 
-        # scale bbox from original image coords to resized coords
-        sx = self.img_size / max(1.0, float(w0))
-        sy = self.img_size / max(1.0, float(h0))
+        # map bbox from original image coords -> padded square coords
         out_boxes: List[Tensor] = []
         for b in chosen:
             x1, y1, x2, y2 = _bbox_xywh_to_xyxy(b)
-            x1 *= sx
-            x2 *= sx
-            y1 *= sy
-            y2 *= sy
+            x1 = x1 * s + float(pad_x)
+            x2 = x2 * s + float(pad_x)
+            y1 = y1 * s + float(pad_y)
+            y2 = y2 * s + float(pad_y)
             out_boxes.append(torch.tensor([x1, y1, x2, y2], dtype=torch.float32))
 
         box = out_boxes[0] if len(out_boxes) == 1 else torch.stack(out_boxes, dim=0)  # [4] or [K,4]

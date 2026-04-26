@@ -59,6 +59,8 @@ def collate_doc_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "tgt_masks": [b["masks"] for b in batch],
         "tgt_points": [b["points"] for b in batch],
         "paths": [b["path"] for b in batch],
+        "valid_masks": torch.stack([b["valid_mask"] for b in batch], dim=0),
+        "geoms": [b.get("geom") for b in batch],
     }
 
 
@@ -100,6 +102,7 @@ class DocLocalizationJsonDataset(Dataset):
         w0, h0 = im.size
         im = im.resize((self.img_size, self.img_size), Image.BICUBIC)
         image = torch.from_numpy(np.asarray(im).copy()).float().permute(2, 0, 1)
+        valid_mask = torch.ones(self.img_size, self.img_size, dtype=torch.bool)
 
         instances: List[Dict[str, Any]] = rec.get("instances") or []
         labels: List[int] = []
@@ -144,6 +147,8 @@ class DocLocalizationJsonDataset(Dataset):
             "labels": labels_t,
             "masks": masks_t,
             "points": points_t,
+            "valid_mask": valid_mask,
+            "geom": None,
             "path": str(path),
         }
 
@@ -236,6 +241,7 @@ class RWMDLabelMeDataset(Dataset):
 
         img_dir = self.rwmd_root / "img"
         lp = self.rwmd_root / "label_points_resize.json"
+        geom_p = self.rwmd_root / "geom_resize.json"
         if not img_dir.is_dir():
             raise ValueError(f"RWMDLabelMeDataset expects directory {img_dir}/")
         if not lp.is_file():
@@ -245,6 +251,12 @@ class RWMDLabelMeDataset(Dataset):
             raise ValueError(f"No PNG files in {img_dir}")
         with open(lp, "r", encoding="utf-8") as f:
             self._label_points_resize: Dict[str, Any] = json.load(f)
+        self._geom_by_name: Dict[str, Any] = {}
+        if geom_p.is_file():
+            with open(geom_p, "r", encoding="utf-8") as f:
+                g = json.load(f)
+            if isinstance(g, dict):
+                self._geom_by_name = g
 
     def __len__(self) -> int:
         return len(self._img_paths)
@@ -259,24 +271,56 @@ class RWMDLabelMeDataset(Dataset):
         if img_bgr is None:
             raise FileNotFoundError(path_img)
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        h0, w0 = img_rgb.shape[0], img_rgb.shape[1]
+        h0, w0 = int(img_rgb.shape[0]), int(img_rgb.shape[1])
+        if (h0, w0) != (self.img_size, self.img_size):
+            raise ValueError(
+                f"RWMD preprocessed images must be {self.img_size}x{self.img_size} (got {w0}x{h0}). "
+                "Re-run dataset/RWMD_dataset/data_preprocessing_rwdm_1.py with the new letterbox pipeline."
+            )
 
         m_u8 = cv2.imread(str(path_mask), cv2.IMREAD_GRAYSCALE)
         if m_u8 is None:
             raise FileNotFoundError(path_mask)
+        if (int(m_u8.shape[0]), int(m_u8.shape[1])) != (self.img_size, self.img_size):
+            raise ValueError(
+                f"RWMD preprocessed masks must be {self.img_size}x{self.img_size} (got {m_u8.shape[1]}x{m_u8.shape[0]})."
+            )
 
         ids = sorted(int(x) for x in np.unique(m_u8) if int(x) > 0)
         if not ids:
             labels_t = torch.zeros(0, dtype=torch.long)
             masks_t = torch.zeros(0, self.img_size, self.img_size)
             points_t = torch.zeros(0, self.point_dim)
-            im = Image.fromarray(img_rgb).resize((self.img_size, self.img_size), Image.BICUBIC)
-            image = torch.from_numpy(np.asarray(im).copy()).float().permute(2, 0, 1)
-            return {"image": image, "labels": labels_t, "masks": masks_t, "points": points_t, "path": str(path_img)}
+            image = torch.from_numpy(np.asarray(img_rgb).copy()).float().permute(2, 0, 1)
+            valid_mask = torch.zeros(self.img_size, self.img_size, dtype=torch.bool)
+            return {
+                "image": image,
+                "labels": labels_t,
+                "masks": masks_t,
+                "points": points_t,
+                "valid_mask": valid_mask,
+                "geom": None,
+                "path": str(path_img),
+            }
 
         fore_idx = max(ids)
 
         fg_raw = self._label_points_resize.get(path_img.name) or self._label_points_resize.get(path_img.stem, [])
+        geom = self._geom_by_name.get(path_img.name) or self._geom_by_name.get(path_img.stem) or None
+        # valid region from geom (letterbox); True = valid, False = padding.
+        valid_mask = torch.zeros(self.img_size, self.img_size, dtype=torch.bool)
+        if isinstance(geom, dict):
+            pad_x = int(geom.get("pad_x", 0))
+            pad_y = int(geom.get("pad_y", 0))
+            new_w = int(geom.get("new_w", 0))
+            new_h = int(geom.get("new_h", 0))
+            if new_w > 0 and new_h > 0:
+                x0 = max(0, pad_x)
+                y0 = max(0, pad_y)
+                x1 = min(self.img_size, pad_x + new_w)
+                y1 = min(self.img_size, pad_y + new_h)
+                if x1 > x0 and y1 > y0:
+                    valid_mask[y0:y1, x0:x1] = True
 
         labels: List[int] = []
         masks: List[Tensor] = []
@@ -287,12 +331,14 @@ class RWMDLabelMeDataset(Dataset):
         for inst_id in ids_kept:
             bin_np = (m_u8 == inst_id).astype(np.float32)
             m = torch.from_numpy(bin_np).unsqueeze(0)
+            # Preprocessed masks are already img_size×img_size; keep this op for safety but it is a no-op.
             m = F.interpolate(m.unsqueeze(0), size=(self.img_size, self.img_size), mode="nearest").squeeze(0).squeeze(0)
             masks.append(m)
 
             if inst_id == fore_idx and isinstance(fg_raw, list) and len(fg_raw) >= 3:
                 quad = _rwmd_quad_corners_xy(fg_raw)
-                pt = _rwmd_flatten_points_norm(quad, w0, h0, self.num_points)
+                # `label_points_resize.json` stores pixel coords in the **padded** img_size×img_size frame.
+                pt = _rwmd_flatten_points_norm(quad, self.img_size, self.img_size, self.num_points)
             else:
                 # Background instances have masks/labels but no corner-point supervision.
                 pt = torch.full((self.point_dim,), -1.0, dtype=torch.float32)
@@ -303,8 +349,7 @@ class RWMDLabelMeDataset(Dataset):
                 raise ValueError(f"label {lab} out of range [0, {self.num_classes})")
             labels.append(lab)
 
-        im = Image.fromarray(img_rgb).resize((self.img_size, self.img_size), Image.BICUBIC)
-        image = torch.from_numpy(np.asarray(im).copy()).float().permute(2, 0, 1)
+        image = torch.from_numpy(np.asarray(img_rgb).copy()).float().permute(2, 0, 1)
 
         labels_t = torch.tensor(labels, dtype=torch.long)
         masks_t = torch.stack(masks, dim=0)
@@ -315,5 +360,7 @@ class RWMDLabelMeDataset(Dataset):
             "labels": labels_t,
             "masks": masks_t,
             "points": points_t,
+            "valid_mask": valid_mask,
+            "geom": geom,
             "path": str(path_img),
         }

@@ -29,7 +29,23 @@ def parse_args() -> argparse.Namespace:
 def _load_rgb_resized_u8(path: Path, img_size: int) -> np.ndarray:
     from PIL import Image
 
-    im = Image.open(path).convert("RGB").resize((img_size, img_size), Image.BILINEAR)
+    im = Image.open(path).convert("RGB")
+    w0, h0 = im.size
+    s = float(img_size) / float(max(int(w0), int(h0), 1))
+    new_w = max(1, int(round(float(w0) * s)))
+    new_h = max(1, int(round(float(h0) * s)))
+    pad_x = int((img_size - new_w) // 2)
+    pad_y = int((img_size - new_h) // 2)
+    im_r = im.resize((new_w, new_h), Image.BILINEAR)
+    canvas = Image.new("RGB", (img_size, img_size), (0, 0, 0))
+    canvas.paste(im_r, (pad_x, pad_y))
+    return np.asarray(canvas, dtype=np.uint8)
+
+
+def _load_rgb_u8(path: Path) -> np.ndarray:
+    from PIL import Image
+
+    im = Image.open(path).convert("RGB")
     return np.asarray(im, dtype=np.uint8)
 
 
@@ -67,6 +83,31 @@ def _pick_best_q(pred_logits: np.ndarray, *, doc_class_id: int) -> tuple[int, fl
 def _first4_poly_xy(points_flat: np.ndarray) -> np.ndarray:
     pts = points_flat.reshape(-1, 2)[:4]
     pts = pts[(pts[:, 0] >= 0.0) & (pts[:, 1] >= 0.0)]
+    return pts
+
+
+def _inverse_letterbox_points01_to_orig_px(
+    pts01: np.ndarray, *, orig_w: int, orig_h: int, out_size: int
+) -> np.ndarray:
+    """
+    pts01: (N,2) normalized in [0,1] w.r.t the letterbox canvas out_size×out_size.
+    returns: (N,2) float32 in original image pixel coords.
+    """
+    s = float(out_size) / float(max(int(orig_w), int(orig_h), 1))
+    new_w = max(1, int(round(float(orig_w) * s)))
+    new_h = max(1, int(round(float(orig_h) * s)))
+    pad_x = int((out_size - new_w) // 2)
+    pad_y = int((out_size - new_h) // 2)
+    pts = pts01.astype(np.float32).copy()
+    # normalized -> canvas pixels
+    pts[:, 0] = pts[:, 0] * float(out_size)
+    pts[:, 1] = pts[:, 1] * float(out_size)
+    # inverse letterbox
+    pts[:, 0] = (pts[:, 0] - float(pad_x)) / float(s)
+    pts[:, 1] = (pts[:, 1] - float(pad_y)) / float(s)
+    # clamp to image bounds (keep floats for nicer overlay)
+    pts[:, 0] = np.clip(pts[:, 0], 0.0, float(max(orig_w - 1, 1)))
+    pts[:, 1] = np.clip(pts[:, 1], 0.0, float(max(orig_h - 1, 1)))
     return pts
 
 
@@ -170,8 +211,8 @@ def main() -> None:
     img_path = Path(args.image)
     out_path = Path(args.out)
 
-    rgb = _load_rgb_resized_u8(img_path, int(args.img_size))
-    inp = _prep_input(rgb, input_range=str(args.input_range))
+    rgb_canvas = _load_rgb_resized_u8(img_path, int(args.img_size))
+    inp = _prep_input(rgb_canvas, input_range=str(args.input_range))
 
     q_pt, s_pt, pts_pt = infer_pt(
         ckpt_path=ckpt_path,
@@ -185,8 +226,26 @@ def main() -> None:
     poly_pt = _first4_poly_xy(pts_pt)
     poly_tf = _first4_poly_xy(pts_tf)
 
-    left = _draw_overlay(rgb, pts01=poly_pt, title=f"PT q={q_pt} score={s_pt:.4f}")
-    right = _draw_overlay(rgb, pts01=poly_tf, title=f"TFLite q={q_tf} score={s_tf:.4f}")
+    # Visualize on ORIGINAL image (more realistic for downstream use).
+    rgb_orig = _load_rgb_u8(img_path)
+    orig_h, orig_w = int(rgb_orig.shape[0]), int(rgb_orig.shape[1])
+    poly_pt_px = _inverse_letterbox_points01_to_orig_px(
+        poly_pt, orig_w=orig_w, orig_h=orig_h, out_size=int(args.img_size)
+    )
+    poly_tf_px = _inverse_letterbox_points01_to_orig_px(
+        poly_tf, orig_w=orig_w, orig_h=orig_h, out_size=int(args.img_size)
+    )
+
+    # Reuse drawing by converting px -> normalized in original frame.
+    poly_pt01_orig = poly_pt_px.copy()
+    poly_tf01_orig = poly_tf_px.copy()
+    poly_pt01_orig[:, 0] /= float(max(orig_w - 1, 1))
+    poly_pt01_orig[:, 1] /= float(max(orig_h - 1, 1))
+    poly_tf01_orig[:, 0] /= float(max(orig_w - 1, 1))
+    poly_tf01_orig[:, 1] /= float(max(orig_h - 1, 1))
+
+    left = _draw_overlay(rgb_orig, pts01=poly_pt01_orig, title=f"PT q={q_pt} score={s_pt:.4f}")
+    right = _draw_overlay(rgb_orig, pts01=poly_tf01_orig, title=f"TFLite q={q_tf} score={s_tf:.4f}")
 
     vis = np.concatenate([left, right], axis=1)
     out_path.parent.mkdir(parents=True, exist_ok=True)

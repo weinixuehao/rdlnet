@@ -533,7 +533,17 @@ def resize_customdata(
     json_save: Optional[dict] = None,
     max_edge: int = 1024,
 ):
-    """Resize image/mask by longest edge to ``max_edge``; scale ``label_points`` the same way; write ``label_points_resize.json``."""
+    """
+    Resize image/mask by letterbox (keep aspect) into a fixed ``max_edge×max_edge`` canvas.
+
+    This is the **only** supported preprocessing geometry for RWMD in this repo:
+    - image: bilinear/area resize then pad to square
+    - mask: nearest resize then pad with 0 background
+    - label_points_resize.json: foreground_doc quad points in **padded canvas pixel coords**
+
+    The previous "longest-edge resize without padding" logic is intentionally removed to avoid
+    train/infer geometry mismatches.
+    """
     if json_save is None:
         json_save = {}
     os.makedirs(os.path.join(dst_dir, "img"), exist_ok=True)
@@ -543,6 +553,8 @@ def resize_customdata(
     with open(json_path, "r", encoding="utf-8") as f:
         json_label = json.load(f)
     stem_index = _label_points_stem_index(json_label)
+
+    geom_save: dict = {}
 
     for img_p in tqdm(imgs_paths):
         img = cv2.imread(img_p)
@@ -554,23 +566,24 @@ def resize_customdata(
         if mask is None:
             continue
 
-        max_size = max(img.shape[0], img.shape[1])
-        scale = 1.0
-        if max_size > max_edge:
-            scale = max_edge / max_size
-            img = cv2.resize(
-                img,
-                (int(img.shape[1] * scale), int(img.shape[0] * scale)),
-                interpolation=cv2.INTER_AREA,
-            )
-            mask = cv2.resize(
-                mask,
-                (int(mask.shape[1] * scale), int(mask.shape[0] * scale)),
-                interpolation=cv2.INTER_NEAREST,
-            )
+        h0, w0 = int(img.shape[0]), int(img.shape[1])
+        # Letterbox: keep aspect ratio, then pad to square (max_edge x max_edge).
+        s = float(max_edge) / float(max(h0, w0))
+        new_w = max(1, int(round(w0 * s)))
+        new_h = max(1, int(round(h0 * s)))
+        pad_x = int((max_edge - new_w) // 2)
+        pad_y = int((max_edge - new_h) // 2)
 
-        cv2.imwrite(os.path.join(dst_dir, "img", img_n), img)
-        cv2.imwrite(os.path.join(dst_dir, "mask", img_n), mask)
+        img_r = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA if s < 1.0 else cv2.INTER_LINEAR)
+        mask_r = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+
+        canvas = np.zeros((max_edge, max_edge, 3), dtype=img_r.dtype)
+        canvas_mask = np.zeros((max_edge, max_edge), dtype=mask_r.dtype)
+        canvas[pad_y : pad_y + new_h, pad_x : pad_x + new_w] = img_r
+        canvas_mask[pad_y : pad_y + new_h, pad_x : pad_x + new_w] = mask_r
+
+        cv2.imwrite(os.path.join(dst_dir, "img", img_n), canvas)
+        cv2.imwrite(os.path.join(dst_dir, "mask", img_n), canvas_mask)
 
         # `label_points.json` keys are expected to be image basenames (often `*.png`).
         # The previous code mistakenly used `json_label.get(img_n)` as a *key*, which becomes a
@@ -580,18 +593,44 @@ def resize_customdata(
 
         if not pts:
             json_save[img_n] = []
+            geom_save[img_n] = {
+                "orig_w": w0,
+                "orig_h": h0,
+                "scale": s,
+                "pad_x": pad_x,
+                "pad_y": pad_y,
+                "out_size": int(max_edge),
+                "new_w": new_w,
+                "new_h": new_h,
+            }
             continue
 
         # Defensive: points should be list[[x,y], ...] (often length 4 for `foreground_doc` quad).
         if not isinstance(pts, list) or (len(pts) > 0 and (not isinstance(pts[0], (list, tuple)) or len(pts[0]) != 2)):
             raise ValueError(f"bad label_points for {img_n}: type={type(pts).__name__} sample={str(pts)[:200]}")
 
-        point_scale = np.asarray(pts, dtype=np.float64) * scale
-        json_save[img_n] = point_scale.tolist()
+        pts_np = np.asarray(pts, dtype=np.float64)
+        pts_np = pts_np * s
+        pts_np[:, 0] += float(pad_x)
+        pts_np[:, 1] += float(pad_y)
+        json_save[img_n] = pts_np.tolist()
+        geom_save[img_n] = {
+            "orig_w": w0,
+            "orig_h": h0,
+            "scale": s,
+            "pad_x": pad_x,
+            "pad_y": pad_y,
+            "out_size": int(max_edge),
+            "new_w": new_w,
+            "new_h": new_h,
+        }
 
     out_json = os.path.join(dst_dir, "label_points_resize.json")
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(json_save, f, indent=4, ensure_ascii=False)
+    out_geom = os.path.join(dst_dir, "geom_resize.json")
+    with open(out_geom, "w", encoding="utf-8") as f:
+        json.dump(geom_save, f, indent=2, ensure_ascii=False)
     return json_save
 
 

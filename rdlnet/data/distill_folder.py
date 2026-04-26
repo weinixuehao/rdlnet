@@ -84,7 +84,16 @@ class DistillImageFolder(Dataset):
     def __getitem__(self, idx: int) -> Tuple[Tensor, str]:
         path = self.paths[self._epoch_indices[idx]]
         im = Image.open(path).convert("RGB")
-        im = im.resize((self.img_size, self.img_size), Image.BICUBIC)
-        t = torch.from_numpy(np.asarray(im).copy()).float()  # H,W,3
+        # Letterbox to square (keep aspect, then pad).
+        w0, h0 = im.size
+        s = float(self.img_size) / float(max(int(w0), int(h0), 1))
+        new_w = max(1, int(round(float(w0) * s)))
+        new_h = max(1, int(round(float(h0) * s)))
+        pad_x = int((self.img_size - new_w) // 2)
+        pad_y = int((self.img_size - new_h) // 2)
+        im_r = im.resize((new_w, new_h), Image.BICUBIC)
+        canvas = Image.new("RGB", (self.img_size, self.img_size), (0, 0, 0))
+        canvas.paste(im_r, (pad_x, pad_y))
+        t = torch.from_numpy(np.asarray(canvas).copy()).float()  # H,W,3
         t = t.permute(2, 0, 1).contiguous()
         return t, str(path)
