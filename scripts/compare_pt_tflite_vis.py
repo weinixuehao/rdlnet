@@ -27,31 +27,32 @@ def parse_args() -> argparse.Namespace:
 
 
 def _load_rgb_resized_u8(path: Path, img_size: int) -> np.ndarray:
-    import cv2
+    import cv2  # type: ignore
 
     bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if bgr is None:
-        raise SystemExit(f"Failed to read image: {path}")
+        raise FileNotFoundError(str(path))
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     h0, w0 = int(rgb.shape[0]), int(rgb.shape[1])
-    s = float(img_size) / float(max(h0, w0))
+    s = float(img_size) / float(max(int(h0), int(w0), 1))
     new_w = max(1, int(round(float(w0) * s)))
     new_h = max(1, int(round(float(h0) * s)))
     pad_x = int((img_size - new_w) // 2)
     pad_y = int((img_size - new_h) // 2)
     resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
     canvas = np.zeros((img_size, img_size, 3), dtype=np.uint8)
-    canvas[pad_y : pad_y + new_h, pad_x : pad_x + new_w, :] = resized
+    canvas[pad_y : pad_y + new_h, pad_x : pad_x + new_w] = resized
     return canvas
 
 
 def _load_rgb_u8(path: Path) -> np.ndarray:
-    import cv2
+    import cv2  # type: ignore
 
     bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if bgr is None:
-        raise SystemExit(f"Failed to read image: {path}")
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        raise FileNotFoundError(str(path))
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    return np.asarray(rgb, dtype=np.uint8)
 
 
 def _prep_input(rgb_u8: np.ndarray, *, input_range: str) -> np.ndarray:
@@ -63,7 +64,7 @@ def _prep_input(rgb_u8: np.ndarray, *, input_range: str) -> np.ndarray:
     return x
 
 
-def _sam_norm_torch(x: "torch.Tensor", *, input_range: str) -> "torch.Tensor":
+def _sam_norm_torch(x: "torch.Tensor", *, input_range: str) -> "torch.Tensor":  # type: ignore[name-defined]
     import torch
 
     y = x
