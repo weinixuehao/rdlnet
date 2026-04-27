@@ -216,6 +216,7 @@ def validate_one_epoch_coco(
     device: torch.device,
     *,
     use_amp: bool,
+    max_batches: int = 0,
 ) -> tuple[float, float, float]:
     distill.eval()
     loss_sum = 0.0
@@ -223,6 +224,8 @@ def validate_one_epoch_coco(
     md_sum = 0.0
     n = 0
     for imgs, boxes, _meta in loader:
+        if max_batches and n >= int(max_batches):
+            break
         imgs = imgs.to(device)
         boxes = boxes.to(device)
         with autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
@@ -284,10 +287,28 @@ def parse_args() -> argparse.Namespace:
         help="TensorBoard mask visualization interval in optimizer steps (0 disables).",
     )
     p.add_argument(
+        "--tb-log-interval",
+        type=int,
+        default=20,
+        help="TensorBoard scalar logging interval in optimizer steps (0 disables).",
+    )
+    p.add_argument(
         "--tb-vis-max-samples",
         type=int,
         default=4,
         help="Max samples (rows) per TensorBoard visualization grid.",
+    )
+    p.add_argument(
+        "--train-max-batches",
+        type=int,
+        default=0,
+        help="Cap train epoch length by number of DataLoader batches (0 = full epoch). Useful for quick curves/debug.",
+    )
+    p.add_argument(
+        "--val-max-batches",
+        type=int,
+        default=0,
+        help="Cap validation by number of DataLoader batches (0 = full validation set).",
     )
     p.add_argument(
         "--seed",
@@ -345,6 +366,8 @@ def main() -> None:
     if device.type == "cuda":
         print(f"         ({torch.cuda.get_device_name(0)})")
     print(f"AMP (bf16 autocast): {'on' if use_amp else 'off'}")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     cfg = DistillConfig(
         temperature=args.temperature,
@@ -484,7 +507,14 @@ def main() -> None:
             accum = args.grad_accum_steps
             accum_count = 0
             opt.zero_grad(set_to_none=True)
+            step_loss_sum = 0.0
+            step_kl_sum = 0.0
+            step_md_sum = 0.0
+            step_n = 0
+            t_last_update = time.perf_counter()
             for batch in pbar:
+                if args.train_max_batches and n_batches >= int(args.train_max_batches):
+                    break
                 imgs, boxes, _meta = batch
                 imgs = imgs.to(device)
                 boxes = boxes.to(device)
@@ -497,6 +527,10 @@ def main() -> None:
                 epoch_kl_sum += float(out["loss_kl"].detach())
                 epoch_md_sum += float(out["loss_md"].detach())
                 n_batches += 1
+                step_loss_sum += float(loss.detach())
+                step_kl_sum += float(out["loss_kl"].detach())
+                step_md_sum += float(out["loss_md"].detach())
+                step_n += 1
                 pbar.set_postfix(
                     step=n_batches,
                     loss=f"{loss.item():.4f}",
@@ -513,12 +547,25 @@ def main() -> None:
                     opt.zero_grad(set_to_none=True)
                     accum_count = 0
                     if did_step:
+                        dt = time.perf_counter() - t_last_update
+                        t_last_update = time.perf_counter()
                         global_step += 1
                         try:
                             lr = float(opt.param_groups[0]["lr"])
                             writer.add_scalar("train/lr", lr, global_step)
                         except Exception:
                             pass
+                        if args.tb_log_interval and args.tb_log_interval > 0 and (global_step % int(args.tb_log_interval) == 0):
+                            denom = max(1, int(step_n))
+                            writer.add_scalar("train/kd", step_loss_sum / denom, global_step)
+                            writer.add_scalar("train/kl", step_kl_sum / denom, global_step)
+                            writer.add_scalar("train/md", step_md_sum / denom, global_step)
+                            if dt > 0:
+                                writer.add_scalar("time/update_sec", float(dt), global_step)
+                            step_loss_sum = 0.0
+                            step_kl_sum = 0.0
+                            step_md_sum = 0.0
+                            step_n = 0
                         if args.tb_vis_interval and args.tb_vis_interval > 0 and (global_step % int(args.tb_vis_interval) == 0):
                             distill.eval()
                             with torch.no_grad():
@@ -539,108 +586,114 @@ def main() -> None:
                             )
                             distill.train()
 
-        if accum_count > 0:
-            scale = accum / accum_count
-            for p in distill.parameters():
-                if p.grad is not None:
-                    p.grad.mul_(scale)
-            if args.max_grad_norm and args.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=float(args.max_grad_norm))
-            did_step = _optimizer_step(opt)
-            if did_step:
-                scheduler.step()
-            opt.zero_grad(set_to_none=True)
-            if did_step:
-                global_step += 1
+            if accum_count > 0:
+                scale = accum / accum_count
+                for p in distill.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(scale)
+                if args.max_grad_norm and args.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=float(args.max_grad_norm))
+                did_step = _optimizer_step(opt)
+                if did_step:
+                    scheduler.step()
+                opt.zero_grad(set_to_none=True)
+                if did_step:
+                    global_step += 1
+                    try:
+                        lr = float(opt.param_groups[0]["lr"])
+                        writer.add_scalar("train/lr", lr, global_step)
+                    except Exception:
+                        pass
+
+            if n_batches > 0:
+                m_loss = epoch_loss_sum / n_batches
+                m_kl = epoch_kl_sum / n_batches
+                m_md = epoch_md_sum / n_batches
+                writer.add_scalar("train/kd_epoch", m_loss, epoch + 1)
+                writer.add_scalar("train/kl_epoch", m_kl, epoch + 1)
+                writer.add_scalar("train/md_epoch", m_md, epoch + 1)
+
+            val_kd, val_kl, val_md = validate_one_epoch_coco(
+                val_loader,
+                distill,
+                device,
+                use_amp=use_amp,
+                max_batches=int(args.val_max_batches),
+            )
+            print(f"[val] kd={val_kd:.4f}  kl={val_kl:.4f}  md={val_md:.4f}  (best_kd={best_val_kd:.4f})")
+            writer.add_scalar("val/kd_epoch", val_kd, epoch + 1)
+            writer.add_scalar("val/kl_epoch", val_kl, epoch + 1)
+            writer.add_scalar("val/md_epoch", val_md, epoch + 1)
+            if args.tb_vis_max_samples and int(args.tb_vis_max_samples) > 0:
+                distill.eval()
                 try:
-                    lr = float(opt.param_groups[0]["lr"])
-                    writer.add_scalar("train/lr", lr, global_step)
-                except Exception:
-                    pass
+                    vb = next(iter(val_loader))
+                    vimgs, vboxes, _vmeta = vb
+                    vimgs = vimgs.to(device)
+                    vboxes = vboxes.to(device)
+                    with torch.no_grad():
+                        vis = distill.predict_low_res_logits(vimgs, vboxes)
+                    grid = _distill_vis_compare_grid_u8(
+                        vimgs.detach().cpu(),
+                        vboxes.detach().cpu(),
+                        vis["low_res_t"].detach().cpu(),
+                        vis["low_res_s"].detach().cpu(),
+                        title=f"val masks (epoch {epoch + 1})",
+                        max_samples=int(args.tb_vis_max_samples),
+                    )
+                    writer.add_image(
+                        f"val/masks/compare/epoch_{epoch + 1:04d}",
+                        grid.transpose(2, 0, 1),
+                        global_step=epoch + 1,
+                        dataformats="CHW",
+                    )
+                except Exception as e:
+                    print(f"Warning: failed to log val mask visualization: {e}")
+                finally:
+                    distill.train()
+            if val_kd < best_val_kd:
+                best_val_kd = val_kd
+                meta_best = {
+                    "img_size": args.img_size,
+                    "backbone_dim": rdl_cfg.backbone_dim,
+                    "backbone_depth": rdl_cfg.backbone_depth,
+                    "lite": int(args.lite),
+                    "epochs_done": epoch + 1,
+                    "seed": args.seed,
+                    "amp": use_amp,
+                    "dataset": "coco",
+                    "run_dir": str(run_dir),
+                    "note": "best by val KD",
+                    "step_unit": "update",
+                    "val_kd": float(val_kd),
+                    "val_kl": float(val_kl),
+                    "val_md": float(val_md),
+                }
+                best_state = distill_trainable_state_dict(distill, meta=meta_best)
+                best_state["best_val_kd"] = best_val_kd
+                torch.save(best_state, best_ckpt)
+                print(f"Saved best checkpoint -> {best_ckpt}")
 
-        if n_batches > 0:
-            m_loss = epoch_loss_sum / n_batches
-            m_kl = epoch_kl_sum / n_batches
-            m_md = epoch_md_sum / n_batches
-            writer.add_scalar("train/kd_epoch", m_loss, epoch + 1)
-            writer.add_scalar("train/kl_epoch", m_kl, epoch + 1)
-            writer.add_scalar("train/md_epoch", m_md, epoch + 1)
-
-        val_kd, val_kl, val_md = validate_one_epoch_coco(val_loader, distill, device, use_amp=use_amp)
-        print(f"[val] kd={val_kd:.4f}  kl={val_kl:.4f}  md={val_md:.4f}  (best_kd={best_val_kd:.4f})")
-        writer.add_scalar("val/kd_epoch", val_kd, epoch + 1)
-        writer.add_scalar("val/kl_epoch", val_kl, epoch + 1)
-        writer.add_scalar("val/md_epoch", val_md, epoch + 1)
-        if args.tb_vis_max_samples and int(args.tb_vis_max_samples) > 0:
-            distill.eval()
-            try:
-                vb = next(iter(val_loader))
-                vimgs, vboxes, _vmeta = vb
-                vimgs = vimgs.to(device)
-                vboxes = vboxes.to(device)
-                with torch.no_grad():
-                    vis = distill.predict_low_res_logits(vimgs, vboxes)
-                grid = _distill_vis_compare_grid_u8(
-                    vimgs.detach().cpu(),
-                    vboxes.detach().cpu(),
-                    vis["low_res_t"].detach().cpu(),
-                    vis["low_res_s"].detach().cpu(),
-                    title=f"val masks (epoch {epoch + 1})",
-                    max_samples=int(args.tb_vis_max_samples),
-                )
-                writer.add_image(
-                    f"val/masks/compare/epoch_{epoch + 1:04d}",
-                    grid.transpose(2, 0, 1),
-                    global_step=epoch + 1,
-                    dataformats="CHW",
-                )
-            except Exception as e:
-                print(f"Warning: failed to log val mask visualization: {e}")
-            finally:
-                distill.train()
-        if val_kd < best_val_kd:
-            best_val_kd = val_kd
-            meta_best = {
+            meta = {
                 "img_size": args.img_size,
                 "backbone_dim": rdl_cfg.backbone_dim,
                 "backbone_depth": rdl_cfg.backbone_depth,
                 "lite": int(args.lite),
                 "epochs_done": epoch + 1,
+                "grad_accum_steps": args.grad_accum_steps,
                 "seed": args.seed,
                 "amp": use_amp,
                 "dataset": "coco",
                 "run_dir": str(run_dir),
-                "note": "best by val KD",
                 "step_unit": "update",
-                "val_kd": float(val_kd),
-                "val_kl": float(val_kl),
-                "val_md": float(val_md),
             }
-            best_state = distill_trainable_state_dict(distill, meta=meta_best)
-            best_state["best_val_kd"] = best_val_kd
-            torch.save(best_state, best_ckpt)
-            print(f"Saved best checkpoint -> {best_ckpt}")
-
-        meta = {
-            "img_size": args.img_size,
-            "backbone_dim": rdl_cfg.backbone_dim,
-            "backbone_depth": rdl_cfg.backbone_depth,
-            "lite": int(args.lite),
-            "epochs_done": epoch + 1,
-            "grad_accum_steps": args.grad_accum_steps,
-            "seed": args.seed,
-            "amp": use_amp,
-            "dataset": "coco",
-            "run_dir": str(run_dir),
-            "step_unit": "update",
-        }
-        ckpt = distill_trainable_state_dict(distill, meta=meta)
-        ckpt["optimizer"] = opt.state_dict()
-        ckpt["scheduler"] = scheduler.state_dict()
-        ckpt["global_step"] = global_step
-        ckpt["best_val_kd"] = best_val_kd
-        torch.save(ckpt, out_path)
-        print(f"Saved checkpoint to {out_path}")
+            ckpt = distill_trainable_state_dict(distill, meta=meta)
+            ckpt["optimizer"] = opt.state_dict()
+            ckpt["scheduler"] = scheduler.state_dict()
+            ckpt["global_step"] = global_step
+            ckpt["best_val_kd"] = best_val_kd
+            torch.save(ckpt, out_path)
+            print(f"Saved checkpoint to {out_path}")
     finally:
         writer.flush()
         writer.close()

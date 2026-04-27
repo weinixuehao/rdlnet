@@ -31,8 +31,11 @@ exec python train_distill.py \
   --seed 42 \
   --epochs 1000 \
   --batch-size 1 \
-  --grad-accum-steps 4 \
+  --grad-accum-steps 2 \
   --num-workers 4 \
   --lite 10 \
   --amp \
+  --train-max-batches 10000 \
+  --val-max-batches 800 \
+  --tb-log-interval 500 \
   "$@"
