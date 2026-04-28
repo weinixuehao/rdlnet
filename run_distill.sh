@@ -21,11 +21,11 @@ if [ -n "${RESUME:-}" ]; then
   set -- --resume "$RESUME" "$@"
 fi
 
-exec python train_distill.py \
-  --coco-train-dir dataset/coco/train2017 \
-  --coco-instances-json dataset/coco/annotations/instances_train2017.json \
-  --coco-val-dir dataset/coco/val2017 \
-  --coco-val-instances-json dataset/coco/annotations/instances_val2017.json \
+exec python3 train_distill.py \
+  --dataset rwmd \
+  --rwmd-train-root output/data/train_resize_aug \
+  --rwmd-val-root output/data/test_resize \
+  --rwmd-max-points 8 \
   --teacher-checkpoint checkpoints/sam/sam_vit_h_4b8939.pth \
   --output output/distill \
   --seed 42 \
@@ -35,8 +35,8 @@ exec python train_distill.py \
   --num-workers 4 \
   --lite 10 \
   --amp \
-  --train-max-batches 5000 \
-  --val-max-batches 400 \
-  --tb-log-interval 500 \
-  --resume output/distill/20260427_113851_lite10/checkpoint.pt \
+  --train-max-batches 0 \
+  --val-max-batches 0 \
+  --tb-log-interval 100 \
+  --tb-vis-interval 500 \
   "$@"

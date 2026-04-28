@@ -33,7 +33,7 @@ _REPO = Path(__file__).resolve().parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from rdlnet.data import CocoTrain2017BoxPrompts
+from rdlnet.data import CocoTrain2017BoxPrompts, RWMDPreprocessedPointPrompts, collate_distill_rwmd_points
 from rdlnet.device import pick_device
 from rdlnet.distill import (
     DistillConfig,
@@ -67,6 +67,22 @@ def collate_distill_coco_box(batch):
     return imgs, boxes, metas
 
 
+def _draw_points_on_axes(ax, points_xy: torch.Tensor, point_labels: torch.Tensor):
+    # points_xy: [P,2], labels: [P]
+    try:
+        pts = points_xy.detach().cpu()
+        lbs = point_labels.detach().cpu()
+        for (x, y), lb in zip(pts.tolist(), lbs.tolist()):
+            if int(lb) < 0:
+                continue
+            if int(lb) == 1:
+                ax.scatter([x], [y], s=40, c="lime", marker="x", linewidths=2)
+            else:
+                ax.scatter([x], [y], s=40, c="red", marker="x", linewidths=2)
+    except Exception:
+        return
+
+
 def _chw_u8_hwc(images_chw: torch.Tensor):
     import numpy as np
 
@@ -78,9 +94,11 @@ def _chw_u8_hwc(images_chw: torch.Tensor):
 
 def _distill_vis_grid_u8(
     images: torch.Tensor,
-    boxes_xyxy: torch.Tensor,
-    low_res_logits: torch.Tensor,
     *,
+    boxes_xyxy: torch.Tensor | None = None,
+    points_xy: torch.Tensor | None = None,
+    point_labels: torch.Tensor | None = None,
+    low_res_logits: torch.Tensor,
     title: str,
     max_samples: int,
     mask_alpha: float = 0.45,
@@ -110,17 +128,22 @@ def _distill_vis_grid_u8(
     w_img = int(images.shape[-1])
     prob_up = F.interpolate(prob.unsqueeze(1), size=(h_img, w_img), mode="bilinear", align_corners=False).squeeze(1)
 
+    if (boxes_xyxy is None) == (points_xy is None):
+        raise ValueError("Provide exactly one of boxes_xyxy or points_xy for visualization")
     ncols = 2
     fig, axes = plt.subplots(b, ncols, figsize=(4.6 * ncols, 3.8 * b), squeeze=False)
     for i in range(b):
         rgb = _chw_u8_hwc(images[i])
         axes[i, 0].imshow(rgb)
-        axes[i, 0].set_title("image + box")
+        axes[i, 0].set_title("image + prompt")
         axes[i, 0].axis("off")
 
-        x1, y1, x2, y2 = [float(v) for v in boxes_xyxy[i].detach().cpu().tolist()]
-        rect = plt.Rectangle((x1, y1), max(0.0, x2 - x1), max(0.0, y2 - y1), fill=False, linewidth=2.0, edgecolor="lime")
-        axes[i, 0].add_patch(rect)
+        if boxes_xyxy is not None:
+            x1, y1, x2, y2 = [float(v) for v in boxes_xyxy[i].detach().cpu().tolist()]
+            rect = plt.Rectangle((x1, y1), max(0.0, x2 - x1), max(0.0, y2 - y1), fill=False, linewidth=2.0, edgecolor="lime")
+            axes[i, 0].add_patch(rect)
+        else:
+            _draw_points_on_axes(axes[i, 0], points_xy[i], point_labels[i])
 
         axes[i, 1].imshow(rgb)
         axes[i, 1].imshow(prob_up[i].detach().cpu().numpy(), cmap="magma", alpha=float(mask_alpha), vmin=0.0, vmax=1.0)
@@ -139,10 +162,12 @@ def _distill_vis_grid_u8(
 
 def _distill_vis_compare_grid_u8(
     images: torch.Tensor,
-    boxes_xyxy: torch.Tensor,
+    *,
+    boxes_xyxy: torch.Tensor | None = None,
+    points_xy: torch.Tensor | None = None,
+    point_labels: torch.Tensor | None = None,
     low_res_t: torch.Tensor,
     low_res_s: torch.Tensor,
-    *,
     title: str,
     max_samples: int,
     mask_alpha: float = 0.45,
@@ -161,6 +186,8 @@ def _distill_vis_compare_grid_u8(
     b = min(bsz, int(max_samples))
     if b <= 0:
         return np.zeros((1, 1, 3), dtype=np.uint8)
+    if (boxes_xyxy is None) == (points_xy is None):
+        raise ValueError("Provide exactly one of boxes_xyxy or points_xy for visualization")
 
     def _prob_up(low_res_logits: torch.Tensor) -> torch.Tensor:
         prob = low_res_logits.detach().float().sigmoid()
@@ -181,12 +208,15 @@ def _distill_vis_compare_grid_u8(
     fig, axes = plt.subplots(b, ncols, figsize=(4.6 * ncols, 3.8 * b), squeeze=False)
     for i in range(b):
         rgb = _chw_u8_hwc(images[i])
-        x1, y1, x2, y2 = [float(v) for v in boxes_xyxy[i].detach().cpu().tolist()]
-        rect = plt.Rectangle((x1, y1), max(0.0, x2 - x1), max(0.0, y2 - y1), fill=False, linewidth=2.0, edgecolor="lime")
 
         axes[i, 0].imshow(rgb)
-        axes[i, 0].add_patch(rect)
-        axes[i, 0].set_title("image + box")
+        if boxes_xyxy is not None:
+            x1, y1, x2, y2 = [float(v) for v in boxes_xyxy[i].detach().cpu().tolist()]
+            rect = plt.Rectangle((x1, y1), max(0.0, x2 - x1), max(0.0, y2 - y1), fill=False, linewidth=2.0, edgecolor="lime")
+            axes[i, 0].add_patch(rect)
+        else:
+            _draw_points_on_axes(axes[i, 0], points_xy[i], point_labels[i])
+        axes[i, 0].set_title("image + prompt")
         axes[i, 0].axis("off")
 
         axes[i, 1].imshow(rgb)
@@ -229,7 +259,38 @@ def validate_one_epoch_coco(
         imgs = imgs.to(device)
         boxes = boxes.to(device)
         with autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-            out = distill(imgs, boxes)
+            out = distill(imgs, boxes_xyxy=boxes)
+        loss_sum += float(out["loss"].detach())
+        kl_sum += float(out["loss_kl"].detach())
+        md_sum += float(out["loss_md"].detach())
+        n += 1
+    if n == 0:
+        return float("inf"), float("inf"), float("inf")
+    return loss_sum / n, kl_sum / n, md_sum / n
+
+
+@torch.no_grad()
+def validate_one_epoch_rwmd(
+    loader: DataLoader,
+    distill: nn.Module,
+    device: torch.device,
+    *,
+    use_amp: bool,
+    max_batches: int = 0,
+) -> tuple[float, float, float]:
+    distill.eval()
+    loss_sum = 0.0
+    kl_sum = 0.0
+    md_sum = 0.0
+    n = 0
+    for imgs, points, point_labels, _meta in loader:
+        if max_batches and n >= int(max_batches):
+            break
+        imgs = imgs.to(device)
+        points = points.to(device)
+        point_labels = point_labels.to(device)
+        with autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
+            out = distill(imgs, points_xy=points, point_labels=point_labels)
         loss_sum += float(out["loss"].detach())
         kl_sum += float(out["loss_kl"].detach())
         md_sum += float(out["loss_md"].detach())
@@ -241,10 +302,20 @@ def validate_one_epoch_coco(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Stage 1: distill Light-SAM student from SAM ViT-H")
+    p.add_argument(
+        "--dataset",
+        type=str,
+        default="coco",
+        choices=["coco", "rwmd"],
+        help="Distillation dataset source. 'rwmd' expects preprocessed folders with img/ and mask/.",
+    )
     p.add_argument("--coco-train-dir", type=str, default="dataset/coco/train2017", help="Extracted COCO train2017/ directory")
     p.add_argument("--coco-instances-json", type=str, default="dataset/coco/annotations/instances_train2017.json")
     p.add_argument("--coco-val-dir", type=str, default="dataset/coco/val2017", help="Extracted COCO val2017/ directory")
     p.add_argument("--coco-val-instances-json", type=str, default="dataset/coco/annotations/instances_val2017.json")
+    p.add_argument("--rwmd-train-root", type=str, default="output/data/train_resize_aug", help="RWMD preprocessed train root (contains img/ and mask/)")
+    p.add_argument("--rwmd-val-root", type=str, default="output/data/test_resize", help="RWMD preprocessed val/test root (contains img/ and mask/)")
+    p.add_argument("--rwmd-max-points", type=int, default=8, help="Max positive points per sample (one per connected component, capped).")
     p.add_argument("--teacher-checkpoint", type=str, required=True, help="sam_vit_h_4b8939.pth")
     p.add_argument(
         "--output",
@@ -256,10 +327,17 @@ def parse_args() -> argparse.Namespace:
         "--resume",
         type=str,
         default=None,
-        help="Resume from stage-1 checkpoint.pt (weights + optimizer/scheduler if present). "
+        help="Resume from a stage-1 run directory (auto-loads checkpoint.pt) or a checkpoint.pt file. "
+        "When resuming, training continues in the SAME run directory (no new folder). "
         "Note: best.pt is not resumable.",
     )
-    p.add_argument("--epochs", type=int, default=1, help="Number of additional epochs to run in this session")
+    p.add_argument(
+        "--epochs",
+        type=int,
+        default=1,
+        help="Total target epochs for this run. If resuming and checkpoint has epochs_done=E, "
+        "this invocation trains remaining max(0, epochs - E) epochs.",
+    )
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument(
         "--grad-accum-steps",
@@ -340,6 +418,25 @@ def _make_run_dir(output_root: str | Path, *, lite: int) -> Path:
     return root / f"{stamp}_lite{int(lite)}"
 
 
+def _resolve_resume_path(resume: str | Path) -> tuple[Path, Path]:
+    """
+    Returns (run_dir, checkpoint_path).
+    Accepts either:
+      - <run_dir>/ (directory) -> <run_dir>/checkpoint.pt
+      - <run_dir>/checkpoint.pt (file) -> run_dir = parent
+    """
+    p = Path(resume).expanduser().resolve()
+    if p.is_dir():
+        run_dir = p
+        ckpt = run_dir / "checkpoint.pt"
+    else:
+        ckpt = p
+        run_dir = ckpt.parent
+    if not ckpt.is_file():
+        raise SystemExit(f"--resume checkpoint not found: {ckpt}")
+    return run_dir, ckpt
+
+
 def _make_tb_writer(run_dir: Path) -> SummaryWriter:
     tb_dir = run_dir / "tb"
     tb_dir.mkdir(parents=True, exist_ok=True)
@@ -379,13 +476,38 @@ def main() -> None:
     rdl_cfg = RDLNetConfig(img_size=args.img_size, use_sam_pixel_norm=True)
     apply_lite_preset(rdl_cfg, int(args.lite))
 
-    ds = CocoTrain2017BoxPrompts(
-        images=args.coco_train_dir,
-        instances_json=args.coco_instances_json,
-        img_size=args.img_size,
-        seed=args.seed,
-        instances_per_image=1,
-    )
+    if args.dataset == "coco":
+        ds = CocoTrain2017BoxPrompts(
+            images=args.coco_train_dir,
+            instances_json=args.coco_instances_json,
+            img_size=args.img_size,
+            seed=args.seed,
+            instances_per_image=1,
+        )
+        val_ds = CocoTrain2017BoxPrompts(
+            images=args.coco_val_dir,
+            instances_json=args.coco_val_instances_json,
+            img_size=args.img_size,
+            seed=args.seed + 1337,
+            instances_per_image=1,
+        )
+        collate_fn = collate_distill_coco_box
+        val_collate_fn = collate_distill_coco_box
+    else:
+        ds = RWMDPreprocessedPointPrompts(
+            root=args.rwmd_train_root,
+            img_size=args.img_size,
+            seed=args.seed,
+            max_points=int(args.rwmd_max_points),
+        )
+        val_ds = RWMDPreprocessedPointPrompts(
+            root=args.rwmd_val_root,
+            img_size=args.img_size,
+            seed=args.seed + 1337,
+            max_points=int(args.rwmd_max_points),
+        )
+        collate_fn = collate_distill_rwmd_points
+        val_collate_fn = collate_distill_rwmd_points
     student_image_encoder = build_sam_vit_for_rdlnet_cfg(rdl_cfg)
     teacher_image_encoder = build_teacher_image_encoder_vit_h_with_neck()
     teacher_prompt = build_sam_prompt_encoder(img_size=args.img_size)
@@ -413,7 +535,7 @@ def main() -> None:
     trainable_params = [p for p in distill.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     print(
-        f"distill student (coco): lite={args.lite}  backbone embed_dim={rdl_cfg.backbone_dim}  "
+        f"distill student ({args.dataset}): lite={args.lite}  backbone embed_dim={rdl_cfg.backbone_dim}  "
         f"depth={rdl_cfg.backbone_depth}  (align: train_rdlnet.py --lite {args.lite})"
     )
     scheduler = MultiStepLR(opt, milestones=[40_000, 80_000, 120_000], gamma=0.1)
@@ -421,8 +543,10 @@ def main() -> None:
     start_epoch = 0
     global_step = 0
     best_val_kd = float("inf")
+    run_dir: Path | None = None
     if args.resume:
-        ck = torch.load(args.resume, map_location=device)
+        run_dir, resume_ckpt = _resolve_resume_path(args.resume)
+        ck = torch.load(resume_ckpt, map_location=device)
         if not isinstance(ck, dict):
             raise TypeError("--resume checkpoint must be a dict")
         load_distill_trainable_state_dict(distill, ck)
@@ -439,7 +563,7 @@ def main() -> None:
             )
         start_epoch = int(meta.get("epochs_done", 0))
         global_step = int(ck.get("global_step", 0))
-        print(f"Resumed from {args.resume}: epochs_done={start_epoch}, global_step={global_step}")
+        print(f"Resumed from {resume_ckpt}: run_dir={run_dir}  epochs_done={start_epoch}, global_step={global_step}")
         ck_seed = (ck.get("meta") or {}).get("seed")
         if ck_seed is not None and int(ck_seed) != args.seed:
             print(
@@ -460,27 +584,21 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        collate_fn=collate_distill_coco_box,
+        collate_fn=collate_fn,
         pin_memory=device.type == "cuda",
-    )
-    val_ds = CocoTrain2017BoxPrompts(
-        images=args.coco_val_dir,
-        instances_json=args.coco_val_instances_json,
-        img_size=args.img_size,
-        seed=args.seed + 1337,
-        instances_per_image=1,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        collate_fn=collate_distill_coco_box,
+        collate_fn=val_collate_fn,
         pin_memory=device.type == "cuda",
     )
 
-    run_dir = _make_run_dir(args.output, lite=int(args.lite))
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if run_dir is None:
+        run_dir = _make_run_dir(args.output, lite=int(args.lite))
+        run_dir.mkdir(parents=True, exist_ok=True)
     out_path = run_dir / "checkpoint.pt"
     best_ckpt = run_dir / "best.pt"
     print(f"run_dir => {run_dir}")
@@ -491,7 +609,13 @@ def main() -> None:
         f"grad_accum_steps={args.grad_accum_steps}  |  effective batch size (for optimizer) ≈ {eff_bs}"
     )
 
-    end_epoch = start_epoch + args.epochs
+    end_epoch = int(args.epochs)
+    if end_epoch < start_epoch:
+        print(f"Warning: --epochs ({end_epoch}) < epochs_done ({start_epoch}); nothing to do.")
+        return
+    if end_epoch == start_epoch:
+        print(f"Nothing to do: already at epochs_done == --epochs == {end_epoch}.")
+        return
     try:
         for epoch in range(start_epoch, end_epoch):
             distill.train()
@@ -515,11 +639,19 @@ def main() -> None:
             for batch in pbar:
                 if args.train_max_batches and n_batches >= int(args.train_max_batches):
                     break
-                imgs, boxes, _meta = batch
-                imgs = imgs.to(device)
-                boxes = boxes.to(device)
+                if args.dataset == "coco":
+                    imgs, boxes, _meta = batch
+                    imgs = imgs.to(device)
+                    boxes = boxes.to(device)
+                    prompt_kwargs = {"boxes_xyxy": boxes}
+                else:
+                    imgs, points, point_labels, _meta = batch
+                    imgs = imgs.to(device)
+                    points = points.to(device)
+                    point_labels = point_labels.to(device)
+                    prompt_kwargs = {"points_xy": points, "point_labels": point_labels}
                 with autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-                    out = distill(imgs, boxes)
+                    out = distill(imgs, **prompt_kwargs)
                 loss = out["loss"]
                 (loss / accum).backward()
                 accum_count += 1
@@ -569,12 +701,14 @@ def main() -> None:
                         if args.tb_vis_interval and args.tb_vis_interval > 0 and (global_step % int(args.tb_vis_interval) == 0):
                             distill.eval()
                             with torch.no_grad():
-                                vis = distill.predict_low_res_logits(imgs, boxes)
+                                vis = distill.predict_low_res_logits(imgs, **prompt_kwargs)
                             grid = _distill_vis_compare_grid_u8(
                                 imgs.detach().cpu(),
-                                boxes.detach().cpu(),
-                                vis["low_res_t"].detach().cpu(),
-                                vis["low_res_s"].detach().cpu(),
+                                boxes_xyxy=(boxes.detach().cpu() if args.dataset == "coco" else None),
+                                points_xy=(points.detach().cpu() if args.dataset != "coco" else None),
+                                point_labels=(point_labels.detach().cpu() if args.dataset != "coco" else None),
+                                low_res_t=vis["low_res_t"].detach().cpu(),
+                                low_res_s=vis["low_res_s"].detach().cpu(),
                                 title=f"train masks (epoch {epoch + 1}, step {global_step})",
                                 max_samples=int(args.tb_vis_max_samples),
                             )
@@ -605,21 +739,22 @@ def main() -> None:
                     except Exception:
                         pass
 
-            if n_batches > 0:
-                m_loss = epoch_loss_sum / n_batches
-                m_kl = epoch_kl_sum / n_batches
-                m_md = epoch_md_sum / n_batches
-                writer.add_scalar("train/kd_epoch", m_loss, epoch + 1)
-                writer.add_scalar("train/kl_epoch", m_kl, epoch + 1)
-                writer.add_scalar("train/md_epoch", m_md, epoch + 1)
-
-            val_kd, val_kl, val_md = validate_one_epoch_coco(
-                val_loader,
-                distill,
-                device,
-                use_amp=use_amp,
-                max_batches=int(args.val_max_batches),
-            )
+            if args.dataset == "coco":
+                val_kd, val_kl, val_md = validate_one_epoch_coco(
+                    val_loader,
+                    distill,
+                    device,
+                    use_amp=use_amp,
+                    max_batches=int(args.val_max_batches),
+                )
+            else:
+                val_kd, val_kl, val_md = validate_one_epoch_rwmd(
+                    val_loader,
+                    distill,
+                    device,
+                    use_amp=use_amp,
+                    max_batches=int(args.val_max_batches),
+                )
             print(f"[val] kd={val_kd:.4f}  kl={val_kl:.4f}  md={val_md:.4f}  (best_kd={best_val_kd:.4f})")
             writer.add_scalar("val/kd_epoch", val_kd, epoch + 1)
             writer.add_scalar("val/kl_epoch", val_kl, epoch + 1)
@@ -628,16 +763,29 @@ def main() -> None:
                 distill.eval()
                 try:
                     vb = next(iter(val_loader))
-                    vimgs, vboxes, _vmeta = vb
-                    vimgs = vimgs.to(device)
-                    vboxes = vboxes.to(device)
+                    if args.dataset == "coco":
+                        vimgs, vboxes, _vmeta = vb
+                        vimgs = vimgs.to(device)
+                        vboxes = vboxes.to(device)
+                        v_prompt_kwargs = {"boxes_xyxy": vboxes}
+                        v_points = None
+                        v_point_labels = None
+                    else:
+                        vimgs, v_points, v_point_labels, _vmeta = vb
+                        vimgs = vimgs.to(device)
+                        v_points = v_points.to(device)
+                        v_point_labels = v_point_labels.to(device)
+                        v_prompt_kwargs = {"points_xy": v_points, "point_labels": v_point_labels}
+                        vboxes = None
                     with torch.no_grad():
-                        vis = distill.predict_low_res_logits(vimgs, vboxes)
+                        vis = distill.predict_low_res_logits(vimgs, **v_prompt_kwargs)
                     grid = _distill_vis_compare_grid_u8(
                         vimgs.detach().cpu(),
-                        vboxes.detach().cpu(),
-                        vis["low_res_t"].detach().cpu(),
-                        vis["low_res_s"].detach().cpu(),
+                        boxes_xyxy=(vboxes.detach().cpu() if args.dataset == "coco" else None),
+                        points_xy=(v_points.detach().cpu() if args.dataset != "coco" else None),
+                        point_labels=(v_point_labels.detach().cpu() if args.dataset != "coco" else None),
+                        low_res_t=vis["low_res_t"].detach().cpu(),
+                        low_res_s=vis["low_res_s"].detach().cpu(),
                         title=f"val masks (epoch {epoch + 1})",
                         max_samples=int(args.tb_vis_max_samples),
                     )
@@ -659,9 +807,10 @@ def main() -> None:
                     "backbone_depth": rdl_cfg.backbone_depth,
                     "lite": int(args.lite),
                     "epochs_done": epoch + 1,
+                    "epochs_target": int(args.epochs),
                     "seed": args.seed,
                     "amp": use_amp,
-                    "dataset": "coco",
+                    "dataset": str(args.dataset),
                     "run_dir": str(run_dir),
                     "note": "best by val KD",
                     "step_unit": "update",
@@ -680,10 +829,11 @@ def main() -> None:
                 "backbone_depth": rdl_cfg.backbone_depth,
                 "lite": int(args.lite),
                 "epochs_done": epoch + 1,
+                "epochs_target": int(args.epochs),
                 "grad_accum_steps": args.grad_accum_steps,
                 "seed": args.seed,
                 "amp": use_amp,
-                "dataset": "coco",
+                "dataset": str(args.dataset),
                 "run_dir": str(run_dir),
                 "step_unit": "update",
             }

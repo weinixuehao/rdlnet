@@ -432,19 +432,36 @@ class LightSAMMultiplexDistillationDecoderKD(nn.Module):
         self.d_teacher = self.teacher_image_encoder.blocks[0].attn.qkv.in_features
         self.d_student = self.student_image_encoder.blocks[0].attn.qkv.in_features
 
-    def forward(self, images: Tensor, boxes_xyxy: Tensor) -> Dict[str, Tensor]:
+    def forward(
+        self,
+        images: Tensor,
+        *,
+        boxes_xyxy: Optional[Tensor] = None,
+        points_xy: Optional[Tensor] = None,
+        point_labels: Optional[Tensor] = None,
+    ) -> Dict[str, Tensor]:
         """
         Args:
             images: [B, 3, H, W] in 0–255 or 0–1; normalized to SAM stats inside.
-            boxes_xyxy: [B, 4] in resized-image pixel coords (same frame as images).
+            boxes_xyxy: optional [B, 4] in resized-image pixel coords (same frame as images).
+            points_xy: optional [B, P, 2] points (x,y) in pixel coords (same frame as images).
+            point_labels: optional [B, P] int labels (1=pos, 0=neg, -1=pad).
         """
+        if (boxes_xyxy is None) == (points_xy is None):
+            raise ValueError("Exactly one of boxes_xyxy or points_xy must be provided")
+        if points_xy is not None and point_labels is None:
+            raise ValueError("point_labels must be provided when using points_xy")
+
         x = sam_normalize_images(images)
 
         with torch.no_grad():
             # teacher: (1) token blocks for KM, (2) neck output for mask decoder KL
             _final_t_tok, blocks_t = sam_encoder_block_outputs(self.teacher_image_encoder, x)
             emb_t = self.teacher_image_encoder(x)
-            sparse_t, dense_t = self.teacher_prompt_encoder(points=None, boxes=boxes_xyxy, masks=None)
+            if boxes_xyxy is not None:
+                sparse_t, dense_t = self.teacher_prompt_encoder(points=None, boxes=boxes_xyxy, masks=None)
+            else:
+                sparse_t, dense_t = self.teacher_prompt_encoder(points=(points_xy, point_labels), boxes=None, masks=None)
             low_res_t, _iou_t = self.teacher_mask_decoder(
                 image_embeddings=emb_t,
                 image_pe=self.teacher_prompt_encoder.get_dense_pe(),
@@ -456,7 +473,10 @@ class LightSAMMultiplexDistillationDecoderKD(nn.Module):
         # student forward: prompt/mask are frozen but must remain in graph so grads reach image encoder
         _final_s_tok, blocks_s = sam_encoder_block_outputs(self.student_image_encoder, x)
         emb_s = self.student_image_encoder(x)
-        sparse_s, dense_s = self.student_prompt_encoder(points=None, boxes=boxes_xyxy, masks=None)
+        if boxes_xyxy is not None:
+            sparse_s, dense_s = self.student_prompt_encoder(points=None, boxes=boxes_xyxy, masks=None)
+        else:
+            sparse_s, dense_s = self.student_prompt_encoder(points=(points_xy, point_labels), boxes=None, masks=None)
         low_res_s, _iou_s = self.student_mask_decoder(
             image_embeddings=emb_s,
             image_pe=self.student_prompt_encoder.get_dense_pe(),
@@ -483,7 +503,14 @@ class LightSAMMultiplexDistillationDecoderKD(nn.Module):
         return {"loss": loss, "loss_kl": loss_kl.detach(), "loss_md": loss_md.detach()}
 
     @torch.no_grad()
-    def predict_low_res_logits(self, images: Tensor, boxes_xyxy: Tensor) -> Dict[str, Tensor]:
+    def predict_low_res_logits(
+        self,
+        images: Tensor,
+        *,
+        boxes_xyxy: Optional[Tensor] = None,
+        points_xy: Optional[Tensor] = None,
+        point_labels: Optional[Tensor] = None,
+    ) -> Dict[str, Tensor]:
         """
         Return low-res mask logits for visualization/debug.
 
@@ -491,10 +518,18 @@ class LightSAMMultiplexDistillationDecoderKD(nn.Module):
           - low_res_t: teacher low-res logits, shape [B, M, h, w]
           - low_res_s: student low-res logits, shape [B, M, h, w]
         """
+        if (boxes_xyxy is None) == (points_xy is None):
+            raise ValueError("Exactly one of boxes_xyxy or points_xy must be provided")
+        if points_xy is not None and point_labels is None:
+            raise ValueError("point_labels must be provided when using points_xy")
+
         x = sam_normalize_images(images)
 
         emb_t = self.teacher_image_encoder(x)
-        sparse_t, dense_t = self.teacher_prompt_encoder(points=None, boxes=boxes_xyxy, masks=None)
+        if boxes_xyxy is not None:
+            sparse_t, dense_t = self.teacher_prompt_encoder(points=None, boxes=boxes_xyxy, masks=None)
+        else:
+            sparse_t, dense_t = self.teacher_prompt_encoder(points=(points_xy, point_labels), boxes=None, masks=None)
         low_res_t, _iou_t = self.teacher_mask_decoder(
             image_embeddings=emb_t,
             image_pe=self.teacher_prompt_encoder.get_dense_pe(),
@@ -504,7 +539,10 @@ class LightSAMMultiplexDistillationDecoderKD(nn.Module):
         )
 
         emb_s = self.student_image_encoder(x)
-        sparse_s, dense_s = self.student_prompt_encoder(points=None, boxes=boxes_xyxy, masks=None)
+        if boxes_xyxy is not None:
+            sparse_s, dense_s = self.student_prompt_encoder(points=None, boxes=boxes_xyxy, masks=None)
+        else:
+            sparse_s, dense_s = self.student_prompt_encoder(points=(points_xy, point_labels), boxes=None, masks=None)
         low_res_s, _iou_s = self.student_mask_decoder(
             image_embeddings=emb_s,
             image_pe=self.student_prompt_encoder.get_dense_pe(),
