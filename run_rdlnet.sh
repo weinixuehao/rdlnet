@@ -10,7 +10,7 @@
 #
 # Do not set RESUME and also pass --resume (duplicate flags).
 #
-# If using --distill-checkpoint, use the same --lite (40|20|10) as stage-1 train_distill (COCO or folder).
+# If using --backbone-checkpoint from train_distill, use the same --lite (40|20|10) as stage-1.
 #
 # Requires LF line endings (Unix). On macOS and Ubuntu, prefer .venv/bin/python when present.
 
@@ -26,14 +26,15 @@ if [ -n "${RESUME:-}" ]; then
   set -- --resume "$RESUME" "$@"
 fi
 
-# --distill-checkpoint checkpoints/distill_stage1.pt \
+# --backbone-checkpoint checkpoints/distill_stage1.pt \
+# --lite 10 \
 # --resume output/rdlnet/20260424_111048 \
 exec python train_rdlnet.py \
   --rwmd-root "output/data/train_resize" \
   --val-rwmd-root "output/data/test_resize" \
   --num-classes 2 \
   --output output/rdlnet \
-  --lite 10 \
+  --lite 20 \
   --epochs 500 \
   --batch-size 2 \
   --grad-accum-steps 4 \

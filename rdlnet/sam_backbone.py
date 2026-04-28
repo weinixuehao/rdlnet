@@ -169,6 +169,38 @@ class RDLNetSAMEncoder(nn.Module):
         return last, inter
 
 
+def load_image_encoder_from_checkpoint(
+    backbone: nn.Module,
+    checkpoint_path: str | Path,
+    *,
+    strict: bool = False,
+) -> tuple[list[str], list[str]]:
+    """
+    Load image-encoder weights into a backbone built by `build_backbone`.
+
+    Supports common checkpoint key layouts:
+    - full SAM checkpoints with `image_encoder.*`
+    - wrapped encoder checkpoints with `encoder.*`
+    - plain image encoder state_dict keys
+    """
+    path = Path(checkpoint_path)
+    ck = torch.load(path, map_location="cpu")
+    if isinstance(ck, dict) and "model" in ck:
+        ck = ck["model"]
+    if not isinstance(ck, dict):
+        raise TypeError(f"Expected checkpoint state_dict dict, got: {type(ck)}")
+
+    target = backbone.encoder if hasattr(backbone, "encoder") else backbone
+    state: dict = ck
+    if any(k.startswith("image_encoder.") for k in ck.keys()):
+        state = {k[len("image_encoder.") :]: v for k, v in ck.items() if k.startswith("image_encoder.")}
+    elif any(k.startswith("encoder.") for k in ck.keys()):
+        state = {k[len("encoder.") :]: v for k, v in ck.items() if k.startswith("encoder.")}
+
+    missing, unexpected = target.load_state_dict(state, strict=strict)
+    return list(missing), list(unexpected)
+
+
 def build_backbone(cfg) -> nn.Module:
     """Factory: SAM Table-2 encoder when possible, else fallback ViT from `backbone.py`."""
     use_sam = getattr(cfg, "use_sam_image_encoder", True)

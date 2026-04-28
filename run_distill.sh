@@ -35,7 +35,8 @@ exec python train_distill.py \
   --num-workers 4 \
   --lite 10 \
   --amp \
-  --train-max-batches 10000 \
-  --val-max-batches 800 \
+  --train-max-batches 5000 \
+  --val-max-batches 400 \
   --tb-log-interval 500 \
+  --resume output/distill/20260427_113851_lite10/checkpoint.pt \
   "$@"

@@ -2,22 +2,15 @@
 """
 Stage 2: Train full RDLNet on document localization annotations (paper losses, Sec. 3.4).
 
-Initialize the SAM student backbone from stage-1 ``distill_stage1.pt`` (recommended).
-
-Example (manifest JSON)::
-
-    python train_rdlnet.py \\
-        --annotations data/annotations.json \\
-        --image-root data/images \\
-        --distill-checkpoint checkpoints/distill_stage1.pt \\
-        --output output/rdlnet
+Initialize the backbone from a checkpoint (stage-1 distilled student or SAM encoder weights) via
+``--backbone-checkpoint``.
 
 Example (RWMD preprocessed ``train_resize`` from ``data_preprocessing_rwdm_1``)::
 
     python train_rdlnet.py \\
         --rwmd-root path/to/out/train_resize \\
         --num-classes 2 \\
-        --distill-checkpoint checkpoints/distill_stage1.pt \\
+        --backbone-checkpoint checkpoints/distill_stage1.pt \\
         --output output/rdlnet
 
 Each fresh run creates ``<output>/<YYYYMMDD_HHMMSS>/`` with ``rdlnet.pt`` (each epoch
@@ -29,11 +22,16 @@ See ``rdlnet.data.doc_json`` for the manifest format and :class:`RWMDLabelMeData
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+# Headless environments (no X server) can crash when OpenCV tries to load Qt/xcb.
+# Force an offscreen Qt backend early, before any transitive `import cv2`.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 import torch
@@ -44,11 +42,12 @@ _REPO = Path(__file__).resolve().parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from rdlnet.data import DocLocalizationJsonDataset, RWMDLabelMeDataset, collate_doc_batch
+from rdlnet.data import RWMDLabelMeDataset, collate_doc_batch
 from rdlnet.device import pick_device
 from rdlnet.distill import load_student_encoder_into_rdlnet_from_checkpoint
 from rdlnet.losses import RDLNetLoss, build_matcher
 from rdlnet.model import RDLNet, RDLNetConfig, apply_lite_preset
+from rdlnet.sam_backbone import load_image_encoder_from_checkpoint
 from rdlnet.viz_rdlnet import train_compare_grid_u8
 
 LOSS_HISTORY_KEY = "train_rdlnet_loss_history"
@@ -200,8 +199,6 @@ def _log_compare_grid_to_tb(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Stage 2: train RDLNet on annotated documents")
-    p.add_argument("--annotations", type=str, default=None, help="JSON list (see rdlnet.data.doc_json)")
-    p.add_argument("--image-root", type=str, default=None, help="Root for file_name and mask paths")
     p.add_argument(
         "--rwmd-root",
         type=str,
@@ -221,10 +218,12 @@ def parse_args() -> argparse.Namespace:
         help="Override RDLNetConfig.num_classes (RWMD preprocessed typically uses 2: top sheet vs other)",
     )
     p.add_argument(
-        "--distill-checkpoint",
+        "--backbone-checkpoint",
+        dest="backbone_checkpoint",
         type=str,
         default=None,
-        help="Stage-1 student_encoder weights (ignored if --resume loads a full model)",
+        help="Backbone init checkpoint (stage-1 distilled student or SAM-style image_encoder weights). "
+        "Ignored if --resume loads a full model.",
     )
     p.add_argument(
         "--output",
@@ -268,12 +267,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--img-size", type=int, default=1024)
     p.add_argument(
+        "--use-sam-pixel-norm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Input pixel normalization using SAM's mean/std (same stats as segment_anything/build_sam.py). "
+        "Recommended with SAM-style training. Disable only if your backbone was trained with different norm.",
+    )
+    p.add_argument(
         "--lite",
         type=int,
         default=40,
         choices=[40, 20, 10],
-        help="Size preset (must match stage-1 --lite when using --distill-checkpoint). "
-        "40=default, 20≈20M, 10≈10M (faster train/distill, see apply_lite_preset in model.py).",
+        help="Size preset (must match stage-1 --lite when using distilled student backbone checkpoint). "
+        "40=default, 20≈20M, 10≈10M (see apply_lite_preset in model.py).",
     )
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument(
@@ -363,31 +369,21 @@ def main() -> None:
     cfg = RDLNetConfig(
         img_size=args.img_size,
         num_classes=num_classes,
-        use_sam_pixel_norm=True,
+        use_sam_pixel_norm=bool(args.use_sam_pixel_norm),
     )
     apply_lite_preset(cfg, int(args.lite))
     if args.img_size % cfg.patch_size != 0:
         raise ValueError("img_size must be divisible by patch_size")
 
-    if args.rwmd_root:
-        ds = RWMDLabelMeDataset(
-            args.rwmd_root,
-            img_size=args.img_size,
-            num_classes=cfg.num_classes,
-            num_points=cfg.num_points,
-            max_instances=cfg.num_queries,
-        )
-    else:
-        if not args.annotations or not args.image_root:
-            raise SystemExit("Provide either --rwmd-root, or both --annotations and --image-root")
-        ds = DocLocalizationJsonDataset(
-            args.annotations,
-            args.image_root,
-            img_size=args.img_size,
-            num_classes=cfg.num_classes,
-            num_points=cfg.num_points,
-            max_instances=cfg.num_queries,
-        )
+    if not args.rwmd_root:
+        raise SystemExit("RDLNet stage-2 training expects RWMD preprocessed data. Provide --rwmd-root.")
+    ds = RWMDLabelMeDataset(
+        args.rwmd_root,
+        img_size=args.img_size,
+        num_classes=cfg.num_classes,
+        num_points=cfg.num_points,
+        max_instances=cfg.num_queries,
+    )
 
     if args.val_rwmd_root:
         train_ds, val_ds = ds, RWMDLabelMeDataset(
@@ -486,9 +482,26 @@ def main() -> None:
         print(
             f"Resumed from {resume_ckpt} (run {run_dir}): epoch={start_epoch}, optimizer_step={optimizer_step}"
         )
-    elif args.distill_checkpoint:
-        load_student_encoder_into_rdlnet_from_checkpoint(model, args.distill_checkpoint)
-        print(f"Loaded student backbone from {args.distill_checkpoint}")
+    elif args.backbone_checkpoint:
+        # Try stage-1 distilled checkpoint loader first (full trainable state dict format).
+        loaded = False
+        try:
+            load_student_encoder_into_rdlnet_from_checkpoint(model, args.backbone_checkpoint)
+            print(f"Loaded student backbone from {args.backbone_checkpoint}")
+            loaded = True
+        except Exception:
+            loaded = False
+
+        # Fallback to direct SAM image-encoder state_dict loader.
+        if not loaded:
+            missing, unexpected = load_image_encoder_from_checkpoint(
+                model.backbone, args.backbone_checkpoint, strict=False
+            )
+            print(f"Loaded backbone encoder from {args.backbone_checkpoint}")
+            if missing:
+                print(f"backbone load missing keys: {len(missing)} (first 5: {missing[:5]})")
+            if unexpected:
+                print(f"backbone load unexpected keys: {len(unexpected)} (first 5: {unexpected[:5]})")
 
     if not args.resume:
         out_root = Path(args.output).expanduser().resolve()
