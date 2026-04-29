@@ -146,7 +146,13 @@ def _distill_vis_grid_u8(
             _draw_points_on_axes(axes[i, 0], points_xy[i], point_labels[i])
 
         axes[i, 1].imshow(rgb)
-        axes[i, 1].imshow(prob_up[i].detach().cpu().numpy(), cmap="magma", alpha=float(mask_alpha), vmin=0.0, vmax=1.0)
+        p = prob_up[i].detach().cpu().numpy()
+        axes[i, 1].imshow(p, cmap="magma", alpha=float(mask_alpha), vmin=0.0, vmax=1.0)
+        # Add a threshold contour to make the mask boundary obvious on document images.
+        try:
+            axes[i, 1].contour(p, levels=[0.5], colors=["cyan"], linewidths=1.5)
+        except Exception:
+            pass
         axes[i, 1].set_title("mask overlay")
         axes[i, 1].axis("off")
 
@@ -220,12 +226,22 @@ def _distill_vis_compare_grid_u8(
         axes[i, 0].axis("off")
 
         axes[i, 1].imshow(rgb)
-        axes[i, 1].imshow(t_up[i].detach().cpu().numpy(), cmap="magma", alpha=float(mask_alpha), vmin=0.0, vmax=1.0)
+        pt = t_up[i].detach().cpu().numpy()
+        axes[i, 1].imshow(pt, cmap="magma", alpha=float(mask_alpha), vmin=0.0, vmax=1.0)
+        try:
+            axes[i, 1].contour(pt, levels=[0.5], colors=["cyan"], linewidths=1.5)
+        except Exception:
+            pass
         axes[i, 1].set_title("teacher mask")
         axes[i, 1].axis("off")
 
         axes[i, 2].imshow(rgb)
-        axes[i, 2].imshow(s_up[i].detach().cpu().numpy(), cmap="magma", alpha=float(mask_alpha), vmin=0.0, vmax=1.0)
+        ps = s_up[i].detach().cpu().numpy()
+        axes[i, 2].imshow(ps, cmap="magma", alpha=float(mask_alpha), vmin=0.0, vmax=1.0)
+        try:
+            axes[i, 2].contour(ps, levels=[0.5], colors=["cyan"], linewidths=1.5)
+        except Exception:
+            pass
         axes[i, 2].set_title("student mask")
         axes[i, 2].axis("off")
 

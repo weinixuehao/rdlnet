@@ -38,5 +38,6 @@ exec python3 train_distill.py \
   --train-max-batches 0 \
   --val-max-batches 0 \
   --tb-log-interval 100 \
-  --tb-vis-interval 500 \
+  --tb-vis-interval 250 \
+  --resume output/distill/20260428_135950_lite10 \
   "$@"
