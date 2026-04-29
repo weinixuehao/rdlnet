@@ -92,80 +92,6 @@ def _chw_u8_hwc(images_chw: torch.Tensor):
     return np.transpose(x.numpy(), (1, 2, 0))
 
 
-def _distill_vis_grid_u8(
-    images: torch.Tensor,
-    *,
-    boxes_xyxy: torch.Tensor | None = None,
-    points_xy: torch.Tensor | None = None,
-    point_labels: torch.Tensor | None = None,
-    low_res_logits: torch.Tensor,
-    title: str,
-    max_samples: int,
-    mask_alpha: float = 0.45,
-):
-    """
-    Build a visualization grid: [image+box | mask overlay].
-    Returns RGB uint8 (H, W, 3) as numpy.
-    """
-    import numpy as np
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    bsz = int(images.shape[0])
-    b = min(bsz, int(max_samples))
-    if b <= 0:
-        return np.zeros((1, 1, 3), dtype=np.uint8)
-
-    # pick a single mask per sample (max over multimask heads)
-    prob = low_res_logits.detach().float().sigmoid()
-    if prob.ndim == 4:
-        prob = prob.max(dim=1).values  # [B, h, w]
-
-    # upscale prob to image resolution
-    h_img = int(images.shape[-2])
-    w_img = int(images.shape[-1])
-    prob_up = F.interpolate(prob.unsqueeze(1), size=(h_img, w_img), mode="bilinear", align_corners=False).squeeze(1)
-
-    if (boxes_xyxy is None) == (points_xy is None):
-        raise ValueError("Provide exactly one of boxes_xyxy or points_xy for visualization")
-    ncols = 2
-    fig, axes = plt.subplots(b, ncols, figsize=(4.6 * ncols, 3.8 * b), squeeze=False)
-    for i in range(b):
-        rgb = _chw_u8_hwc(images[i])
-        axes[i, 0].imshow(rgb)
-        axes[i, 0].set_title("image + prompt")
-        axes[i, 0].axis("off")
-
-        if boxes_xyxy is not None:
-            x1, y1, x2, y2 = [float(v) for v in boxes_xyxy[i].detach().cpu().tolist()]
-            rect = plt.Rectangle((x1, y1), max(0.0, x2 - x1), max(0.0, y2 - y1), fill=False, linewidth=2.0, edgecolor="lime")
-            axes[i, 0].add_patch(rect)
-        else:
-            _draw_points_on_axes(axes[i, 0], points_xy[i], point_labels[i])
-
-        axes[i, 1].imshow(rgb)
-        p = prob_up[i].detach().cpu().numpy()
-        axes[i, 1].imshow(p, cmap="magma", alpha=float(mask_alpha), vmin=0.0, vmax=1.0)
-        # Add a threshold contour to make the mask boundary obvious on document images.
-        try:
-            axes[i, 1].contour(p, levels=[0.5], colors=["cyan"], linewidths=1.5)
-        except Exception:
-            pass
-        axes[i, 1].set_title("mask overlay")
-        axes[i, 1].axis("off")
-
-    fig.suptitle(title, fontsize=11, y=1.02)
-    fig.tight_layout()
-    fig.canvas.draw()
-    # Matplotlib 3.8+ on Agg may not expose tostring_rgb(); use buffer_rgba() instead.
-    rgba = np.asarray(fig.canvas.buffer_rgba())  # [H, W, 4] uint8
-    buf = rgba[..., :3].copy()
-    plt.close(fig)
-    return buf
-
-
 def _distill_vis_compare_grid_u8(
     images: torch.Tensor,
     *,
@@ -262,7 +188,6 @@ def validate_one_epoch_coco(
     device: torch.device,
     *,
     use_amp: bool,
-    max_batches: int = 0,
 ) -> tuple[float, float, float]:
     distill.eval()
     loss_sum = 0.0
@@ -270,8 +195,6 @@ def validate_one_epoch_coco(
     md_sum = 0.0
     n = 0
     for imgs, boxes, _meta in loader:
-        if max_batches and n >= int(max_batches):
-            break
         imgs = imgs.to(device)
         boxes = boxes.to(device)
         with autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
@@ -292,7 +215,6 @@ def validate_one_epoch_rwmd(
     device: torch.device,
     *,
     use_amp: bool,
-    max_batches: int = 0,
 ) -> tuple[float, float, float]:
     distill.eval()
     loss_sum = 0.0
@@ -300,8 +222,6 @@ def validate_one_epoch_rwmd(
     md_sum = 0.0
     n = 0
     for imgs, points, point_labels, _meta in loader:
-        if max_batches and n >= int(max_batches):
-            break
         imgs = imgs.to(device)
         points = points.to(device)
         point_labels = point_labels.to(device)
@@ -351,8 +271,8 @@ def parse_args() -> argparse.Namespace:
         "--epochs",
         type=int,
         default=1,
-        help="Total target epochs for this run. If resuming and checkpoint has epochs_done=E, "
-        "this invocation trains remaining max(0, epochs - E) epochs.",
+        help="Total number of outer epochs (1-based counting: last epoch equals this value). "
+        "On resume, meta.epochs_done is the first epoch number (1-based) to continue from.",
     )
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument(
@@ -393,16 +313,11 @@ def parse_args() -> argparse.Namespace:
         help="Max samples (rows) per TensorBoard visualization grid.",
     )
     p.add_argument(
-        "--train-max-batches",
+        "--val-every-steps",
         type=int,
-        default=0,
-        help="Cap train epoch length by number of DataLoader batches (0 = full epoch). Useful for quick curves/debug.",
-    )
-    p.add_argument(
-        "--val-max-batches",
-        type=int,
-        default=0,
-        help="Cap validation by number of DataLoader batches (0 = full validation set).",
+        default=500,
+        help="Run validation + save checkpoint.pt every N optimizer updates (global_step). "
+        "Best checkpoint is updated whenever val kd improves at one of these steps.",
     )
     p.add_argument(
         "--seed",
@@ -459,10 +374,17 @@ def _make_tb_writer(run_dir: Path) -> SummaryWriter:
     return SummaryWriter(log_dir=str(tb_dir))
 
 
+def _resume_start_epoch(meta: dict) -> int:
+    """First epoch number (1-based). Reads ``meta[\"epochs_done\"]`` only (default 1)."""
+    return int(meta.get("epochs_done", 1))
+
+
 def main() -> None:
     args = parse_args()
     if args.grad_accum_steps < 1:
         raise SystemExit("--grad-accum-steps must be >= 1")
+    if int(args.val_every_steps) < 1:
+        raise SystemExit("--val-every-steps must be >= 1")
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -556,7 +478,7 @@ def main() -> None:
     )
     scheduler = MultiStepLR(opt, milestones=[40_000, 80_000, 120_000], gamma=0.1)
 
-    start_epoch = 0
+    start_epoch = 1
     global_step = 0
     best_val_kd = float("inf")
     run_dir: Path | None = None
@@ -577,9 +499,9 @@ def main() -> None:
                 "This run uses update-step semantics (global_step == optimizer updates). "
                 f"Refusing to resume checkpoint with step_unit={step_unit!r}."
             )
-        start_epoch = int(meta.get("epochs_done", 0))
+        start_epoch = _resume_start_epoch(meta)
         global_step = int(ck.get("global_step", 0))
-        print(f"Resumed from {resume_ckpt}: run_dir={run_dir}  epochs_done={start_epoch}, global_step={global_step}")
+        print(f"Resumed from {resume_ckpt}: run_dir={run_dir}  start_epoch={start_epoch}, global_step={global_step}")
         ck_seed = (ck.get("meta") or {}).get("seed")
         if ck_seed is not None and int(ck_seed) != args.seed:
             print(
@@ -625,24 +547,139 @@ def main() -> None:
         f"grad_accum_steps={args.grad_accum_steps}  |  effective batch size (for optimizer) ≈ {eff_bs}"
     )
 
-    end_epoch = int(args.epochs)
-    if end_epoch < start_epoch:
-        print(f"Warning: --epochs ({end_epoch}) < epochs_done ({start_epoch}); nothing to do.")
+    def maybe_val_and_checkpoint(epoch_num: int) -> None:
+        """Validation + checkpoint.pt (+ best.pt if improved). Called after each optimizer step when global_step matches --val-every-steps.
+        epoch_num is 1-based. Saved in meta as ``epochs_done``."""
+        nonlocal best_val_kd
+        if global_step % int(args.val_every_steps) != 0:
+            return
+        if args.dataset == "coco":
+            val_kd, val_kl, val_md = validate_one_epoch_coco(
+                val_loader,
+                distill,
+                device,
+                use_amp=use_amp,
+            )
+        else:
+            val_kd, val_kl, val_md = validate_one_epoch_rwmd(
+                val_loader,
+                distill,
+                device,
+                use_amp=use_amp,
+            )
+        print(
+            f"[val @ step {global_step}] kd={val_kd:.4f}  kl={val_kl:.4f}  md={val_md:.4f}  (best_kd={best_val_kd:.4f})"
+        )
+        writer.add_scalar("val/kd", val_kd, global_step)
+        writer.add_scalar("val/kl", val_kl, global_step)
+        writer.add_scalar("val/md", val_md, global_step)
+        if args.tb_vis_max_samples and int(args.tb_vis_max_samples) > 0:
+            distill.eval()
+            try:
+                vb = next(iter(val_loader))
+                if args.dataset == "coco":
+                    vimgs, vboxes, _vmeta = vb
+                    vimgs = vimgs.to(device)
+                    vboxes = vboxes.to(device)
+                    v_prompt_kwargs = {"boxes_xyxy": vboxes}
+                    v_points = None
+                    v_point_labels = None
+                else:
+                    vimgs, v_points, v_point_labels, _vmeta = vb
+                    vimgs = vimgs.to(device)
+                    v_points = v_points.to(device)
+                    v_point_labels = v_point_labels.to(device)
+                    v_prompt_kwargs = {"points_xy": v_points, "point_labels": v_point_labels}
+                    vboxes = None
+                with torch.no_grad():
+                    vis = distill.predict_low_res_logits(vimgs, **v_prompt_kwargs)
+                grid = _distill_vis_compare_grid_u8(
+                    vimgs.detach().cpu(),
+                    boxes_xyxy=(vboxes.detach().cpu() if args.dataset == "coco" else None),
+                    points_xy=(v_points.detach().cpu() if args.dataset != "coco" else None),
+                    point_labels=(v_point_labels.detach().cpu() if args.dataset != "coco" else None),
+                    low_res_t=vis["low_res_t"].detach().cpu(),
+                    low_res_s=vis["low_res_s"].detach().cpu(),
+                    title=f"val masks (epoch {epoch_num}, step {global_step})",
+                    max_samples=int(args.tb_vis_max_samples),
+                )
+                writer.add_image(
+                    f"val/masks/compare/step_{global_step:08d}",
+                    grid.transpose(2, 0, 1),
+                    global_step=global_step,
+                    dataformats="CHW",
+                )
+            except Exception as e:
+                print(f"Warning: failed to log val mask visualization: {e}")
+            finally:
+                distill.train()
+        else:
+            distill.train()
+
+        if val_kd < best_val_kd:
+            best_val_kd = val_kd
+            meta_best = {
+                "img_size": args.img_size,
+                "backbone_dim": rdl_cfg.backbone_dim,
+                "backbone_depth": rdl_cfg.backbone_depth,
+                "lite": int(args.lite),
+                "epochs_done": epoch_num,
+                "epochs_target": int(args.epochs),
+                "global_step": int(global_step),
+                "seed": args.seed,
+                "amp": use_amp,
+                "dataset": str(args.dataset),
+                "run_dir": str(run_dir),
+                "note": "best by val KD",
+                "step_unit": "update",
+                "val_kd": float(val_kd),
+                "val_kl": float(val_kl),
+                "val_md": float(val_md),
+            }
+            best_state = distill_trainable_state_dict(distill, meta=meta_best)
+            best_state["best_val_kd"] = best_val_kd
+            best_state["global_step"] = int(global_step)
+            torch.save(best_state, best_ckpt)
+            print(f"Saved best checkpoint -> {best_ckpt}")
+
+        meta = {
+            "img_size": args.img_size,
+            "backbone_dim": rdl_cfg.backbone_dim,
+            "backbone_depth": rdl_cfg.backbone_depth,
+            "lite": int(args.lite),
+            "epochs_done": epoch_num,
+            "epochs_target": int(args.epochs),
+            "grad_accum_steps": args.grad_accum_steps,
+            "seed": args.seed,
+            "amp": use_amp,
+            "dataset": str(args.dataset),
+            "run_dir": str(run_dir),
+            "step_unit": "update",
+        }
+        ckpt = distill_trainable_state_dict(distill, meta=meta)
+        ckpt["optimizer"] = opt.state_dict()
+        ckpt["scheduler"] = scheduler.state_dict()
+        ckpt["global_step"] = global_step
+        ckpt["best_val_kd"] = best_val_kd
+        torch.save(ckpt, out_path)
+        print(f"Saved checkpoint to {out_path}")
+
+    total_epochs = int(args.epochs)
+    end_exclusive = total_epochs + 1
+    if start_epoch > total_epochs:
+        print(f"Warning: --epochs ({total_epochs}) < start_epoch ({start_epoch}); nothing to do.")
         return
-    if end_epoch == start_epoch:
-        print(f"Nothing to do: already at epochs_done == --epochs == {end_epoch}.")
+    if start_epoch >= end_exclusive:
+        print(f"Nothing to do: start_epoch ({start_epoch}) >= last epoch plus one ({end_exclusive}).")
         return
     try:
-        for epoch in range(start_epoch, end_epoch):
+        for epoch in range(start_epoch, end_exclusive):
             distill.train()
             pbar = tqdm(
                 loader,
-                desc=f"epoch {epoch + 1}/{end_epoch}",
+                desc=f"epoch {epoch}/{total_epochs}",
                 dynamic_ncols=True,
             )
-            epoch_loss_sum = 0.0
-            epoch_kl_sum = 0.0
-            epoch_md_sum = 0.0
             n_batches = 0
             accum = args.grad_accum_steps
             accum_count = 0
@@ -653,8 +690,6 @@ def main() -> None:
             step_n = 0
             t_last_update = time.perf_counter()
             for batch in pbar:
-                if args.train_max_batches and n_batches >= int(args.train_max_batches):
-                    break
                 if args.dataset == "coco":
                     imgs, boxes, _meta = batch
                     imgs = imgs.to(device)
@@ -671,9 +706,6 @@ def main() -> None:
                 loss = out["loss"]
                 (loss / accum).backward()
                 accum_count += 1
-                epoch_loss_sum += float(loss.detach())
-                epoch_kl_sum += float(out["loss_kl"].detach())
-                epoch_md_sum += float(out["loss_md"].detach())
                 n_batches += 1
                 step_loss_sum += float(loss.detach())
                 step_kl_sum += float(out["loss_kl"].detach())
@@ -725,7 +757,7 @@ def main() -> None:
                                 point_labels=(point_labels.detach().cpu() if args.dataset != "coco" else None),
                                 low_res_t=vis["low_res_t"].detach().cpu(),
                                 low_res_s=vis["low_res_s"].detach().cpu(),
-                                title=f"train masks (epoch {epoch + 1}, step {global_step})",
+                                title=f"train masks (epoch {epoch}, step {global_step})",
                                 max_samples=int(args.tb_vis_max_samples),
                             )
                             writer.add_image(
@@ -735,6 +767,7 @@ def main() -> None:
                                 dataformats="CHW",
                             )
                             distill.train()
+                        maybe_val_and_checkpoint(epoch)
 
             if accum_count > 0:
                 scale = accum / accum_count
@@ -754,112 +787,7 @@ def main() -> None:
                         writer.add_scalar("train/lr", lr, global_step)
                     except Exception:
                         pass
-
-            if args.dataset == "coco":
-                val_kd, val_kl, val_md = validate_one_epoch_coco(
-                    val_loader,
-                    distill,
-                    device,
-                    use_amp=use_amp,
-                    max_batches=int(args.val_max_batches),
-                )
-            else:
-                val_kd, val_kl, val_md = validate_one_epoch_rwmd(
-                    val_loader,
-                    distill,
-                    device,
-                    use_amp=use_amp,
-                    max_batches=int(args.val_max_batches),
-                )
-            print(f"[val] kd={val_kd:.4f}  kl={val_kl:.4f}  md={val_md:.4f}  (best_kd={best_val_kd:.4f})")
-            writer.add_scalar("val/kd_epoch", val_kd, epoch + 1)
-            writer.add_scalar("val/kl_epoch", val_kl, epoch + 1)
-            writer.add_scalar("val/md_epoch", val_md, epoch + 1)
-            if args.tb_vis_max_samples and int(args.tb_vis_max_samples) > 0:
-                distill.eval()
-                try:
-                    vb = next(iter(val_loader))
-                    if args.dataset == "coco":
-                        vimgs, vboxes, _vmeta = vb
-                        vimgs = vimgs.to(device)
-                        vboxes = vboxes.to(device)
-                        v_prompt_kwargs = {"boxes_xyxy": vboxes}
-                        v_points = None
-                        v_point_labels = None
-                    else:
-                        vimgs, v_points, v_point_labels, _vmeta = vb
-                        vimgs = vimgs.to(device)
-                        v_points = v_points.to(device)
-                        v_point_labels = v_point_labels.to(device)
-                        v_prompt_kwargs = {"points_xy": v_points, "point_labels": v_point_labels}
-                        vboxes = None
-                    with torch.no_grad():
-                        vis = distill.predict_low_res_logits(vimgs, **v_prompt_kwargs)
-                    grid = _distill_vis_compare_grid_u8(
-                        vimgs.detach().cpu(),
-                        boxes_xyxy=(vboxes.detach().cpu() if args.dataset == "coco" else None),
-                        points_xy=(v_points.detach().cpu() if args.dataset != "coco" else None),
-                        point_labels=(v_point_labels.detach().cpu() if args.dataset != "coco" else None),
-                        low_res_t=vis["low_res_t"].detach().cpu(),
-                        low_res_s=vis["low_res_s"].detach().cpu(),
-                        title=f"val masks (epoch {epoch + 1})",
-                        max_samples=int(args.tb_vis_max_samples),
-                    )
-                    writer.add_image(
-                        f"val/masks/compare/epoch_{epoch + 1:04d}",
-                        grid.transpose(2, 0, 1),
-                        global_step=epoch + 1,
-                        dataformats="CHW",
-                    )
-                except Exception as e:
-                    print(f"Warning: failed to log val mask visualization: {e}")
-                finally:
-                    distill.train()
-            if val_kd < best_val_kd:
-                best_val_kd = val_kd
-                meta_best = {
-                    "img_size": args.img_size,
-                    "backbone_dim": rdl_cfg.backbone_dim,
-                    "backbone_depth": rdl_cfg.backbone_depth,
-                    "lite": int(args.lite),
-                    "epochs_done": epoch + 1,
-                    "epochs_target": int(args.epochs),
-                    "seed": args.seed,
-                    "amp": use_amp,
-                    "dataset": str(args.dataset),
-                    "run_dir": str(run_dir),
-                    "note": "best by val KD",
-                    "step_unit": "update",
-                    "val_kd": float(val_kd),
-                    "val_kl": float(val_kl),
-                    "val_md": float(val_md),
-                }
-                best_state = distill_trainable_state_dict(distill, meta=meta_best)
-                best_state["best_val_kd"] = best_val_kd
-                torch.save(best_state, best_ckpt)
-                print(f"Saved best checkpoint -> {best_ckpt}")
-
-            meta = {
-                "img_size": args.img_size,
-                "backbone_dim": rdl_cfg.backbone_dim,
-                "backbone_depth": rdl_cfg.backbone_depth,
-                "lite": int(args.lite),
-                "epochs_done": epoch + 1,
-                "epochs_target": int(args.epochs),
-                "grad_accum_steps": args.grad_accum_steps,
-                "seed": args.seed,
-                "amp": use_amp,
-                "dataset": str(args.dataset),
-                "run_dir": str(run_dir),
-                "step_unit": "update",
-            }
-            ckpt = distill_trainable_state_dict(distill, meta=meta)
-            ckpt["optimizer"] = opt.state_dict()
-            ckpt["scheduler"] = scheduler.state_dict()
-            ckpt["global_step"] = global_step
-            ckpt["best_val_kd"] = best_val_kd
-            torch.save(ckpt, out_path)
-            print(f"Saved checkpoint to {out_path}")
+                    maybe_val_and_checkpoint(epoch)
     finally:
         writer.flush()
         writer.close()

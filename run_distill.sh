@@ -35,8 +35,7 @@ exec python3 train_distill.py \
   --num-workers 4 \
   --lite 10 \
   --amp \
-  --train-max-batches 0 \
-  --val-max-batches 0 \
+  --val-every-steps 500 \
   --tb-log-interval 100 \
   --tb-vis-interval 250 \
   --resume output/distill/20260428_135950_lite10 \
